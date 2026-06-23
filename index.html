@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#1f9d8f">
+  <title>PulsePath — Map the bumps. Mind the trail.</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦦</text></svg>">
+</head>
+<body>
+  <div class="device">
+
+    <!-- Top bar -->
+    <header class="topbar">
+      <button class="icon-btn" id="backBtn" style="display:none">←</button>
+      <div class="logo">🦦</div>
+      <div class="title">
+        <b>PulsePath</b>
+        <span id="modePill" class="mode-pill" style="padding:0;background:none">Bike Mode</span>
+      </div>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="voiceBtn" title="Hands-free 'Log Danger'">🎙️</button>
+      <button class="icon-btn" id="darkBtn" title="Dark mode"><span id="darkIcon">☀️</span></button>
+    </header>
+
+    <!-- Toasts -->
+    <div class="toast-wrap" id="toasts"></div>
+
+    <!-- Screens -->
+    <main class="screens">
+      <section id="screen-home"    class="screen active"></section>
+      <section id="screen-map"     class="screen"></section>
+      <section id="screen-track"   class="screen"></section>
+      <section id="screen-inbox"   class="screen"></section>
+      <section id="screen-profile" class="screen"></section>
+      <section id="screen-settings" class="screen"></section>
+    </main>
+
+    <!-- Mascot pop -->
+    <div class="mascot" id="mascot">
+      <div class="o">🦦</div>
+      <b>Nice work!</b>
+      <span>+1 contribution</span>
+    </div>
+
+    <!-- Bottom nav -->
+    <nav class="tabbar">
+      <button class="tab active" data-act="tab" data-tab="home"><span class="ic">🏠</span>Home</button>
+      <button class="tab" data-act="tab" data-tab="map"><span class="ic">🗺️</span>Map</button>
+      <button class="fab" id="fab" title="Quick capture">＋</button>
+      <button class="tab" data-act="tab" data-tab="inbox" style="position:relative">
+        <span class="ic">📥</span>Review
+        <span id="inboxBadge" style="position:absolute;top:-2px;right:18px;min-width:18px;height:18px;border-radius:9px;background:#e4572e;color:#fff;font-size:10px;display:grid;place-items:center;padding:0 4px">0</span>
+      </button>
+      <button class="tab" data-act="tab" data-tab="profile"><span class="ic">👤</span>You</button>
+    </nav>
+
+    <!-- Sheet + scrim -->
+    <div class="scrim" id="scrim"></div>
+    <div class="sheet" id="sheet"></div>
+
+    <!-- Onboarding -->
+    <div class="onb" id="onb">
+      <div class="slides" id="onbSlides"></div>
+      <div class="foot">
+        <button class="btn ghost sm" id="onbSkip">Skip</button>
+        <div class="dots" id="onbDots" style="justify-content:center;align-items:center"></div>
+        <button class="btn sm" id="onbNext" style="min-width:120px">Next</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="js/data.js"></script>
+  <script src="js/sensors.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
