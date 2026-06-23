@@ -189,7 +189,8 @@ function clusterHazards(list) {
     const group = [list[i]]; used.add(i);
     for (let j = i + 1; j < list.length; j++) {
       if (used.has(j)) continue;
-      if (list[i].cat === list[j].cat && dist(list[i], list[j]) < 5) { group.push(list[j]); used.add(j); }
+      // Bundle near-duplicate reports of the same hazard (~same spot).
+      if (list[i].cat === list[j].cat && dist(list[i], list[j]) < 2.5) { group.push(list[j]); used.add(j); }
     }
     clusters.push(group);
   }
@@ -210,7 +211,7 @@ function renderMap() {
     if (group.length > 1) {
       const cx = group.reduce((s, g) => s + g.x, 0) / group.length;
       const cy = group.reduce((s, g) => s + g.y, 0) / group.length;
-      return `<div class="pin cluster" style="left:${cx}%;top:${cy}%" data-act="open-cluster" data-cat="${group[0].cat}">
+      return `<div class="pin cluster" style="left:${cx}%;top:${cy}%" data-act="open-cluster" data-ids="${group.map(g => g.id).join(",")}">
         <div class="bubble" style="background:${CATEGORIES[group[0].cat].color}"><span>${group.length}</span></div></div>`;
     }
     const h = group[0];
@@ -287,11 +288,13 @@ function openPin(id) {
   `, c.label);
 }
 
-function openCluster(cat) {
-  const items = state.hazards.filter(h => h.cat === cat && state.filters[h.cat]);
+function openCluster(ids) {
+  const idSet = ids.split(",");
+  const items = state.hazards.filter(h => idSet.includes(h.id));
+  const cat = items[0] ? items[0].cat : "other";
   openSheet(`
     <h2>${CATEGORIES[cat].icon} ${CATEGORIES[cat].label} cluster</h2>
-    <p class="sub">${items.length} reports bundled into one map pin to keep things tidy.</p>
+    <p class="sub">${items.length} reports of the same hazard bundled into one map pin to keep things tidy.</p>
     ${items.map(h => `
       <div class="inbox-item" data-act="open-pin" data-id="${h.id}">
         <div class="thumb" style="background:${CATEGORIES[cat].color}22">${CATEGORIES[cat].icon}</div>
@@ -867,11 +870,11 @@ function simulateRide() {
 function openSheet(html, title, kind) {
   const sheet = $("#sheet");
   sheet.dataset.kind = kind || "";
-  if (html !== null && html !== undefined) sheet.innerHTML = `<div class="grab"></div>` + html;
+  if (html !== null && html !== undefined) sheet.innerHTML = `<div class="grab" data-act="close-sheet"></div>` + html;
   $("#scrim").classList.add("show");
   sheet.classList.add("show");
 }
-function setSheet(html) { $("#sheet").innerHTML = `<div class="grab"></div>` + html; }
+function setSheet(html) { $("#sheet").innerHTML = `<div class="grab" data-act="close-sheet"></div>` + html; }
 function closeSheet() {
   $("#sheet").classList.remove("show");
   $("#scrim").classList.remove("show");
@@ -904,7 +907,7 @@ document.addEventListener("click", (e) => {
     /* map */
     case "toggle-filter": state.filters[d.cat] = !state.filters[d.cat]; save(); renderMap(); break;
     case "open-pin": openPin(d.id); break;
-    case "open-cluster": openCluster(d.cat); break;
+    case "open-cluster": openCluster(d.ids); break;
     case "cycle-weather": cycleWeather(); break;
     case "locate-me": locateMe(); break;
     case "sim-ride": simulateRide(); break;
