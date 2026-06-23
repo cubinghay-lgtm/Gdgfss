@@ -36,6 +36,31 @@ function geoToXY(lat, lng) {
 }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+// Coarse "open space / trail" test for the Auto map style. Mirrors the old
+// xy heuristic (x>52 || y>56 -> topo) but expressed in lat/lng so it works
+// against the real Leaflet basemap center.
+function isOpenSpace(lat, lng) {
+  return lng > -122.5316 || lat < 37.9872;
+}
+
+// Free, no-key raster basemaps. Street + Satellite send permissive CORS so
+// their tiles can be cached for offline use; Topo may not (caching just
+// skips those tiles, display still works).
+const TILE_LAYERS = {
+  street: {
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: "&copy; OpenStreetMap contributors", maxZoom: 19, subdomains: "abc",
+  },
+  topo: {
+    url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    attribution: "&copy; OpenTopoMap (CC-BY-SA)", maxZoom: 17, subdomains: "abc",
+  },
+  satellite: {
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Imagery &copy; Esri", maxZoom: 19, subdomains: "abc",
+  },
+};
+
 // Seed pins. Mix of verified + unverified, urban + trail.
 const SEED_HAZARDS = [
   { id: "h1", cat: "pothole",  x: 32, y: 38, sev: 4, status: "verified",   votes: 7, note: "Sunken edge near 4th St crosswalk", zone: "urban" },

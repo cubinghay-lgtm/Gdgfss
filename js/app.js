@@ -15,6 +15,7 @@ const DEFAULT_STATE = () => ({
   settings: {
     dark: false, radius: 35, threshold: 13.8, voice: false, tts: true,
     battery: true, mode: "bike", calibrated: false, weather: "clear",
+    mapStyle: "auto", offline: false,
   },
   profile: { name: "River Rider", photo: null, mapped: 3, verified: 5, carbon: 2.4, emails: 0, miles: 42 },
   district: { miles: 1284 },
@@ -196,64 +197,254 @@ function clusterHazards(list) {
   }
   return clusters;
 }
-function mapZone() {
-  // Hybrid auto-switch: south/east region is forest/trail -> topo.
-  return (state.me.x > 52 || state.me.y > 56) ? "topo" : "urban";
+/* ============================================================
+   Leaflet map subsystem
+   Real OSM/topo/satellite tiles when online, an IndexedDB tile
+   cache that fills in as you pan, and an online/offline toggle.
+   The app's internal x/y model is bridged to lat/lng only here.
+   ============================================================ */
+let lmap = null, markerLayer = null, meMarker = null, radiusCircle = null;
+let currentLayer = null, currentResolved = null, cachedTiles = 0;
+const BLANK_TILE = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
+function isOffline() { return state.settings.offline || !navigator.onLine; }
+
+function resolveStyle() {
+  const s = state.settings.mapStyle;
+  if (s !== "auto") return s;
+  if (!lmap) return "street";
+  const c = lmap.getCenter();
+  return isOpenSpace(c.lat, c.lng) ? "topo" : "street";
 }
-const ringUnits = () => clamp(state.settings.radius * 0.16, 3, 22);
 
-function renderMap() {
-  const zone = mapZone();
-  const clusters = clusterHazards(visibleHazards());
-  const wo = WEATHER_STATES.find(x => x.id === state.settings.weather);
+// TileLayer that serves cached tiles when offline and quietly caches tiles
+// (via a CORS fetch) as they load when online.
+const CachingTileLayer = (typeof L !== "undefined") ? L.TileLayer.extend({
+  createTile(coords, done) {
+    const tile = document.createElement("img");
+    tile.alt = "";
+    const key = this.options.styleKey + "/" + coords.z + "/" + coords.x + "/" + coords.y;
+    const url = this.getTileUrl(coords);
+    const fromCache = () => tileGet(key).then(data => {
+      if (data) { tile.src = data; } else { tile.classList.add("tile-missing"); tile.src = BLANK_TILE; }
+      done(null, tile);
+    }).catch(() => { tile.classList.add("tile-missing"); tile.src = BLANK_TILE; done(null, tile); });
+    if (isOffline()) { fromCache(); return tile; }
+    tile.onload = () => { done(null, tile); maybeCacheTile(key, url); };
+    tile.onerror = fromCache;
+    tile.src = url;
+    return tile;
+  },
+}) : null;
 
-  const pinsHtml = clusters.map(group => {
-    if (group.length > 1) {
-      const cx = group.reduce((s, g) => s + g.x, 0) / group.length;
-      const cy = group.reduce((s, g) => s + g.y, 0) / group.length;
-      return `<div class="pin cluster" style="left:${cx}%;top:${cy}%" data-act="open-cluster" data-ids="${group.map(g => g.id).join(",")}">
-        <div class="bubble" style="background:${CATEGORIES[group[0].cat].color}"><span>${group.length}</span></div></div>`;
+function buildLayer(styleKey) {
+  const cfg = TILE_LAYERS[styleKey] || TILE_LAYERS.street;
+  return new CachingTileLayer(cfg.url, {
+    styleKey, attribution: cfg.attribution, maxZoom: cfg.maxZoom || 19,
+    subdomains: cfg.subdomains || "abc",
+  });
+}
+
+function setTileLayer() {
+  if (!lmap) return;
+  const resolved = resolveStyle();
+  if (resolved === currentResolved && currentLayer) return;
+  if (currentLayer) lmap.removeLayer(currentLayer);
+  currentLayer = buildLayer(resolved);
+  currentLayer.addTo(lmap);
+  currentLayer.bringToBack();
+  currentResolved = resolved;
+}
+
+function initMap() {
+  const lat = (GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2;
+  const lng = (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2;
+  lmap = L.map("leafletMap", { zoomControl: false, attributionControl: true }).setView([lat, lng], 13);
+  markerLayer = L.layerGroup().addTo(lmap);
+  setTileLayer();
+  lmap.on("click", (e) => openCapture(geoToXY(e.latlng.lat, e.latlng.lng)));
+  lmap.on("moveend zoomend", () => {
+    if (state.settings.mapStyle === "auto") setTileLayer();
+    refreshMarkers(); updateMapStatus();
+  });
+  openTileDB().then(() => tileCount().then(n => { cachedTiles = n; updateMapStatus(); }));
+}
+
+const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+
+function pinIcon(h) {
+  const c = CATEGORIES[h.cat];
+  return L.divIcon({ className: "hz-pin", html: `<div class="bubble ${h.status}" style="background:${c.color}"><span>${c.icon}</span></div>`, iconSize: [34, 34], iconAnchor: [17, 33] });
+}
+function clusterIcon(group) {
+  const c = CATEGORIES[group[0].cat];
+  return L.divIcon({ className: "hz-pin", html: `<div class="bubble cluster" style="background:${c.color}"><span>${group.length}</span></div>`, iconSize: [40, 40], iconAnchor: [20, 20] });
+}
+
+// Zoom-aware clustering: group same-category pins within ~44px on screen.
+function refreshMarkers() {
+  if (!lmap || !markerLayer) return;
+  markerLayer.clearLayers();
+  const pts = visibleHazards().map(h => ({ h, p: lmap.latLngToContainerPoint([h.lat, h.lng]) }));
+  const used = new Set();
+  for (let i = 0; i < pts.length; i++) {
+    if (used.has(i)) continue;
+    const group = [pts[i].h]; used.add(i);
+    for (let j = i + 1; j < pts.length; j++) {
+      if (used.has(j)) continue;
+      if (pts[i].h.cat === pts[j].h.cat && pts[i].p.distanceTo(pts[j].p) < 44) { group.push(pts[j].h); used.add(j); }
     }
-    const h = group[0];
-    return `<div class="pin ${h.status}" style="left:${h.x}%;top:${h.y}%" data-act="open-pin" data-id="${h.id}">
-      <div class="bubble" style="background:${CATEGORIES[h.cat].color}"><span>${CATEGORIES[h.cat].icon}</span></div></div>`;
-  }).join("");
+    if (group.length > 1) {
+      const ids = group.map(g => g.id).join(",");
+      L.marker([avg(group.map(g => g.lat)), avg(group.map(g => g.lng))], { icon: clusterIcon(group) })
+        .addTo(markerLayer).on("click", () => openCluster(ids));
+    } else {
+      const h = group[0];
+      L.marker([h.lat, h.lng], { icon: pinIcon(h) }).addTo(markerLayer).on("click", () => openPin(h.id));
+    }
+  }
+  updateMeLayer();
+}
 
+function updateMeLayer() {
+  if (!lmap) return;
+  const g = xyToGeo(state.me.x, state.me.y);
+  if (!meMarker) {
+    meMarker = L.marker([g.lat, g.lng], { icon: L.divIcon({ className: "me-icon", html: `<div class="me-blip"></div>`, iconSize: [18, 18], iconAnchor: [9, 9] }), interactive: false, zIndexOffset: 1000 }).addTo(lmap);
+    radiusCircle = L.circle([g.lat, g.lng], { radius: state.settings.radius, color: "#4ea8de", weight: 1.5, dashArray: "5 5", fillColor: "#4ea8de", fillOpacity: .08, interactive: false }).addTo(lmap);
+  } else {
+    meMarker.setLatLng([g.lat, g.lng]);
+    radiusCircle.setLatLng([g.lat, g.lng]).setRadius(state.settings.radius);
+  }
+}
+
+/* ---- IndexedDB tile cache ---- */
+let _tdb = null;
+function openTileDB() {
+  if (_tdb) return Promise.resolve(_tdb);
+  return new Promise((resolve) => {
+    if (!("indexedDB" in window)) return resolve(null);
+    const req = indexedDB.open("pulsepath-tiles", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("tiles");
+    req.onsuccess = () => { _tdb = req.result; resolve(_tdb); };
+    req.onerror = () => resolve(null);
+  });
+}
+function tileGet(key) {
+  return openTileDB().then(db => db ? new Promise((res) => {
+    const r = db.transaction("tiles").objectStore("tiles").get(key);
+    r.onsuccess = () => res(r.result || null); r.onerror = () => res(null);
+  }) : null);
+}
+function tilePut(key, data) {
+  return openTileDB().then(db => { if (db) db.transaction("tiles", "readwrite").objectStore("tiles").put(data, key); });
+}
+function tileCount() {
+  return openTileDB().then(db => db ? new Promise((res) => {
+    const r = db.transaction("tiles").objectStore("tiles").count();
+    r.onsuccess = () => res(r.result || 0); r.onerror = () => res(0);
+  }) : 0);
+}
+function blobToDataURL(blob) {
+  return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });
+}
+async function maybeCacheTile(key, url) {
+  if (isOffline()) return;
+  try {
+    if (await tileGet(key)) return;
+    const res = await fetch(url, { mode: "cors" });
+    if (!res.ok) return;
+    await tilePut(key, await blobToDataURL(await res.blob()));
+    cachedTiles++; updateMapStatus();
+  } catch (e) { /* CORS / network — skip caching, display unaffected */ }
+}
+
+/* ---- Map screen render (persistent Leaflet root + overlay) ---- */
+function renderMap() {
+  const screen = $("#screen-map");
+  if (!$("#leafletMap")) {
+    screen.innerHTML = `<div class="map-wrap"><div id="leafletMap"></div><div id="mapOverlay"></div></div>`;
+    if (typeof L !== "undefined") initMap();
+  }
+  renderMapOverlay();
+  if (lmap) setTimeout(() => { lmap.invalidateSize(); refreshMarkers(); }, 0);
+}
+
+function renderMapOverlay() {
+  const ov = $("#mapOverlay"); if (!ov) return;
+  const wo = WEATHER_STATES.find(x => x.id === state.settings.weather);
   const filterChips = Object.entries(CATEGORIES).map(([k, c]) => `
     <button class="chip ${state.filters[k] ? "" : "off"}" data-act="toggle-filter" data-cat="${k}">
       <span class="dot" style="background:${c.color}"></span>${c.label}</button>`).join("");
+  ov.innerHTML = `
+    <div class="map-search">
+      <input id="mapSearch" placeholder="Search a place or address…" autocomplete="off" enterkeyhint="search">
+      <button class="icon-btn" data-act="map-search" title="Search">🔍</button>
+    </div>
+    <div class="map-top">${filterChips}</div>
+    <button class="chip weather-badge" data-act="cycle-weather">${wo.icon} ${wo.label}</button>
+    <div class="map-rightctrl">
+      <button class="icon-btn mapbtn" data-act="map-style" title="Map style">🗺️</button>
+      <button class="icon-btn mapbtn" data-act="map-offline" title="Online / offline">${isOffline() ? "📴" : "📶"}</button>
+      <button class="icon-btn mapbtn" data-act="map-zoom-in" title="Zoom in">＋</button>
+      <button class="icon-btn mapbtn" data-act="map-zoom-out" title="Zoom out">－</button>
+      <button class="icon-btn mapbtn" data-act="map-recenter" title="Recenter on me">📍</button>
+      <button class="icon-btn mapbtn" data-act="open-demo" title="Demo tools">⋯</button>
+    </div>
+    <div class="map-legend" id="mapStatus"></div>`;
+  updateMapStatus();
+}
 
-  const ru = ringUnits();
-  $("#screen-map").innerHTML = `
-    <div class="map-wrap">
-      <div class="map-canvas ${zone}" id="mapCanvas" data-act="map-tap">
-        <svg class="map-deco" viewBox="0 0 100 100" preserveAspectRatio="none">
-          <path d="M0,40 Q30,30 50,45 T100,38" stroke="${zone === "urban" ? "#9fb0bd" : "#9cc08a"}" stroke-width="2.2" fill="none"/>
-          <path d="M20,0 L34,100" stroke="#aebcc7" stroke-width="3" fill="none" opacity=".5"/>
-          <path d="M60,10 Q70,50 55,100" stroke="#9cc08a" stroke-width="2" fill="none" stroke-dasharray="3 3"/>
-        </svg>
-        <div class="radius-ring" style="left:${state.me.x}%;top:${state.me.y}%;width:${ru * 2}%;height:${ru * 2}%"></div>
-        <div class="me-dot" style="left:${state.me.x}%;top:${state.me.y}%"></div>
-        ${pinsHtml}
-      </div>
+function updateMapStatus() {
+  const el = $("#mapStatus"); if (!el) return;
+  const styleLabel = { auto: "Auto", street: "Street", topo: "Topo", satellite: "Satellite" }[state.settings.mapStyle];
+  const resolved = currentResolved || resolveStyle();
+  el.innerHTML = `${isOffline() ? "📴 Offline" : "📶 Online"} · ${styleLabel}${state.settings.mapStyle === "auto" ? " → " + resolved : ""} · ${visibleHazards().length} pins · 🧩 ${cachedTiles}`;
+}
 
-      <div class="map-top">${filterChips}</div>
-
-      <button class="chip weather-badge" data-act="cycle-weather">${wo.icon} ${wo.label}</button>
-
-      <div class="map-legend">${zone === "urban" ? "🏙️ Street view" : "⛰️ Topographic"} · ${visibleHazards().length} pins</div>
-
-      <div style="position:absolute;right:12px;bottom:14px;z-index:10;display:flex;flex-direction:column;gap:8px">
-        <button class="icon-btn" style="background:var(--surface);box-shadow:var(--shadow-sm)" data-act="locate-me" title="Find me">📍</button>
-        <button class="icon-btn" style="background:var(--surface);box-shadow:var(--shadow-sm)" data-act="sim-ride" title="Simulate ride">🛰️</button>
-      </div>
-    </div>`;
+/* ---- Map control actions ---- */
+const MAP_STYLES = ["auto", "street", "topo", "satellite"];
+function cycleMapStyle() {
+  const i = MAP_STYLES.indexOf(state.settings.mapStyle);
+  state.settings.mapStyle = MAP_STYLES[(i + 1) % MAP_STYLES.length];
+  save(); setTileLayer(); renderMapOverlay();
+  toast(`🗺️ Map: ${state.settings.mapStyle}`);
+}
+function toggleOffline() {
+  state.settings.offline = !state.settings.offline;
+  save();
+  if (currentLayer && lmap) { lmap.removeLayer(currentLayer); currentLayer = null; currentResolved = null; setTileLayer(); }
+  renderMapOverlay();
+  toast(state.settings.offline ? "📴 Offline — using cached tiles" : "📶 Back online");
+}
+function recenterMap() { locateMe(); }
+async function doMapSearch() {
+  const inp = $("#mapSearch"); if (!inp || !lmap) return;
+  const q = inp.value.trim(); if (!q) return;
+  if (isOffline()) { toast("📴 Search needs a connection"); return; }
+  toast("🔍 Searching…");
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`, { headers: { "Accept": "application/json" } });
+    const j = await r.json();
+    if (j && j[0]) { lmap.flyTo([+j[0].lat, +j[0].lon], 15, { duration: .8 }); toast(`📍 ${j[0].display_name.split(",")[0]}`, "good"); }
+    else toast("No results for that place");
+  } catch (e) { toast("Search unavailable here (try served over http)"); }
+}
+function openDemoMenu() {
+  openSheet(`
+    <h2>⋯ Demo / preview tools</h2>
+    <p class="sub">Handy on desktop where real sensors aren't available. Hidden from the main UI so the app stays clean.</p>
+    <button class="btn mt" data-act="demo-sim-ride">🛰️ Simulate a ride (auto-logs + proximity)</button>
+    <button class="btn ghost mt" data-act="demo-drop-pin">📌 Drop a test report at map center</button>
+    <button class="btn ghost mt" data-act="demo-jump">🗺️ Jump to Marin area</button>
+  `, "Demo");
 }
 
 function openPin(id) {
   const h = state.hazards.find(x => x.id === id);
   if (!h) return;
   const c = CATEGORIES[h.cat];
+  if (lmap && currentScreen === "map") lmap.flyTo([h.lat, h.lng], Math.max(lmap.getZoom(), 16), { duration: .6 });
   const d = (dist(state.me, h) * 150).toFixed(0); // ~150m per map unit
   openSheet(`
     <div class="flex" style="gap:14px">
@@ -292,6 +483,9 @@ function openCluster(ids) {
   const idSet = ids.split(",");
   const items = state.hazards.filter(h => idSet.includes(h.id));
   const cat = items[0] ? items[0].cat : "other";
+  if (lmap && currentScreen === "map" && items.length) {
+    lmap.flyToBounds(L.latLngBounds(items.map(h => [h.lat, h.lng])).pad(0.6), { maxZoom: 17, duration: .6 });
+  }
   openSheet(`
     <h2>${CATEGORIES[cat].icon} ${CATEGORIES[cat].label} cluster</h2>
     <p class="sub">${items.length} reports of the same hazard bundled into one map pin to keep things tidy.</p>
@@ -830,9 +1024,10 @@ function exportGeoJSON() {
 /* --- Proximity engine --- */
 const alertedPins = new Set();
 function checkProximity() {
+  const ru = state.settings.radius / 150; // meters -> xy units (~150m per unit)
   state.hazards.filter(h => h.status === "unverified").forEach(h => {
     const d = dist(state.me, h);
-    if (d < ringUnits()) {
+    if (d < ru) {
       if (!alertedPins.has(h.id)) {
         alertedPins.add(h.id);
         Sensors.buzz([60, 40, 60]);
@@ -840,7 +1035,7 @@ function checkProximity() {
         toast(`⚠️ Unverified ${c.label} nearby — can you confirm it?`, "alert", 3200);
         if (state.settings.tts) Sensors.speak(`Heads up. ${c.label} reported ahead.`);
       }
-    } else if (d > ringUnits() * 1.4) {
+    } else if (d > ru * 1.4) {
       alertedPins.delete(h.id);
     }
   });
@@ -858,7 +1053,7 @@ function simulateRide() {
     state.me.x = a.x + (b.x - a.x) * step;
     state.me.y = a.y + (b.y - a.y) * step;
     if (step >= 1) { step = 0; i++; }
-    if (currentScreen === "map") renderMap();
+    if (currentScreen === "map") updateMeLayer();
     checkProximity();
     if (Math.random() < 0.04) logPulse(state.settings.threshold + Math.random() * 3);
   }, 120);
@@ -905,13 +1100,20 @@ document.addEventListener("click", (e) => {
       break;
 
     /* map */
-    case "toggle-filter": state.filters[d.cat] = !state.filters[d.cat]; save(); renderMap(); break;
+    case "toggle-filter": state.filters[d.cat] = !state.filters[d.cat]; save(); refreshMarkers(); renderMapOverlay(); break;
     case "open-pin": openPin(d.id); break;
     case "open-cluster": openCluster(d.ids); break;
     case "cycle-weather": cycleWeather(); break;
-    case "locate-me": locateMe(); break;
-    case "sim-ride": simulateRide(); break;
-    case "map-tap": if (e.target.id === "mapCanvas") mapTap(e); break;
+    case "locate-me": case "map-recenter": recenterMap(); break;
+    case "map-style": cycleMapStyle(); break;
+    case "map-offline": toggleOffline(); break;
+    case "map-zoom-in": if (lmap) lmap.zoomIn(); break;
+    case "map-zoom-out": if (lmap) lmap.zoomOut(); break;
+    case "map-search": doMapSearch(); break;
+    case "open-demo": openDemoMenu(); break;
+    case "demo-sim-ride": closeSheet(); simulateRide(); break;
+    case "demo-drop-pin": closeSheet(); if (lmap) { const c = lmap.getCenter(); openCapture(geoToXY(c.lat, c.lng)); } break;
+    case "demo-jump": closeSheet(); if (lmap) lmap.flyTo([(GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2, (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2], 13, { duration: .6 }); break;
 
     /* pin actions */
     case "confirm-pin": confirmPin(d.id); break;
@@ -994,12 +1196,6 @@ function readImage(input, cb) {
 }
 
 /* ---------------- Action implementations ---------------- */
-function mapTap(e) {
-  const rect = $("#mapCanvas").getBoundingClientRect();
-  const x = ((e.clientX - rect.left) / rect.width) * 100;
-  const y = ((e.clientY - rect.top) / rect.height) * 100;
-  openCapture({ x: clamp(x, 4, 96), y: clamp(y, 6, 94) });
-}
 function confirmPin(id) {
   const h = state.hazards.find(x => x.id === id);
   if (!h) return;
@@ -1092,15 +1288,16 @@ async function locateMe() {
   toast("📍 Getting your location…");
   const pos = await Sensors.getPosition();
   if (pos) {
-    const xy = geoToXY(pos.lat, pos.lng);
-    state.me = xy; save(); renderMap(); checkProximity();
+    state.me = geoToXY(pos.lat, pos.lng);
     toast("📍 Location found", "good");
   } else {
     // demo nudge
     state.me = { x: clamp(state.me.x + (Math.random() - 0.5) * 20, 10, 90), y: clamp(state.me.y + (Math.random() - 0.5) * 20, 10, 90) };
-    save(); renderMap(); checkProximity();
     toast("📍 GPS unavailable — using demo position");
   }
+  save(); checkProximity();
+  const g = xyToGeo(state.me.x, state.me.y);
+  if (lmap) { updateMeLayer(); lmap.flyTo([g.lat, g.lng], Math.max(lmap.getZoom(), 14), { duration: .6 }); }
 }
 
 async function startPatrol() {
@@ -1209,6 +1406,14 @@ function boot() {
   $("#voiceBtn").addEventListener("click", toggleVoice);
   $("#backBtn").addEventListener("click", () => showScreen("home"));
   $("#fab").addEventListener("click", () => openCapture());
+
+  // Search on Enter within the map search field
+  document.addEventListener("keydown", (ev) => {
+    if (ev.target && ev.target.id === "mapSearch" && ev.key === "Enter") { ev.preventDefault(); doMapSearch(); }
+  });
+  // React to real connectivity changes
+  window.addEventListener("online", () => { if (currentScreen === "map") { renderMapOverlay(); } });
+  window.addEventListener("offline", () => { if (currentScreen === "map") { renderMapOverlay(); } });
 
   showScreen("home");
 
