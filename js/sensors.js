@@ -24,6 +24,25 @@ const Sensors = {
     });
   },
 
+  // Continuous position stream for trip recording. Returns false if the
+  // browser can't watch position, so the caller can fall back to a sim.
+  _watchId: null,
+  startWatch(onPos) {
+    if (!this.geoSupported) return false;
+    this.stopWatch();
+    try {
+      this._watchId = navigator.geolocation.watchPosition(
+        (p) => onPos({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy }),
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 1000, timeout: 8000 }
+      );
+      return true;
+    } catch (e) { return false; }
+  },
+  stopWatch() {
+    if (this._watchId != null) { try { navigator.geolocation.clearWatch(this._watchId); } catch (e) {} this._watchId = null; }
+  },
+
   /* ---------- Haptics ---------- */
   buzz(pattern = 60) { if (navigator.vibrate) navigator.vibrate(pattern); },
 

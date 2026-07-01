@@ -19,6 +19,7 @@ const DEFAULT_STATE = () => ({
   },
   profile: { name: "River Rider", photo: null, mapped: 3, verified: 5, carbon: 2.4, emails: 0, miles: 42 },
   district: { miles: 1284 },
+  trips: SEED_TRIPS.map(t => ({ ...t })),
   me: { x: 41, y: 44 },
 });
 
@@ -367,7 +368,7 @@ function renderMap() {
     if (typeof L !== "undefined") initMap();
   }
   renderMapOverlay();
-  if (lmap) setTimeout(() => { lmap.invalidateSize(); refreshMarkers(); }, 0);
+  if (lmap) setTimeout(() => { lmap.invalidateSize(); refreshMarkers(); drawActiveRoute(); }, 0);
 }
 
 function renderMapOverlay() {
@@ -515,6 +516,7 @@ function renderTrack() {
           <span class="emoji">${mm.icon}</span><b>${mm.label}</b><span>${modeBlurb(k)}</span></button>`).join("")}
     </div>
     <div id="modePanel"></div>
+    ${tripsHtml()}
   `;
   renderModePanel();
 }
@@ -655,8 +657,9 @@ function pushMeter(mag) {
 async function toggleTrack() {
   if (tracking.on) { stopTrack(); return; }
   tracking.on = true; tracking.samples = [];
+  startTrip(state.settings.mode);
   renderModePanel();
-  toast("🚲 Tracking started — ride safe!", "good");
+  toast(`${MODE_META[state.settings.mode].icon} Tracking started — stay safe!`, "good");
   const ok = await Sensors.startMotion(onMotionSample);
   if (!ok) {
     // Desktop fallback: synthesize gentle road noise so the meter lives.
@@ -665,13 +668,27 @@ async function toggleTrack() {
       onMotionSample(noise);
     }, 90);
   }
+  // Stream real GPS for the route; if unavailable — or if no fix arrives
+  // quickly (desktop preview, GPS cold-start) — simulate a walk so the
+  // recorder still produces a visible route.
+  tracking.gotFix = false;
+  const gps = Sensors.startWatch((pos) => {
+    tracking.gotFix = true;
+    if (tracking.fakeWalk) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; }
+    onTrackPosition(pos.lat, pos.lng);
+  });
+  if (!gps) startFakeWalk();
+  else tracking.warmup = setTimeout(() => { if (tracking.on && !tracking.gotFix) startFakeWalk(); }, 2500);
 }
 function stopTrack() {
   tracking.on = false;
   Sensors.stopMotion();
+  Sensors.stopWatch();
+  if (tracking.warmup) { clearTimeout(tracking.warmup); tracking.warmup = null; }
   if (tracking.fakeTimer) { clearInterval(tracking.fakeTimer); tracking.fakeTimer = null; }
-  renderModePanel();
-  toast("⏹ Tracking stopped");
+  if (tracking.fakeWalk) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; }
+  endTrip();
+  if (currentScreen === "track") renderTrack(); else renderModePanel();
 }
 function onMotionSample(mag) {
   pushMeter(mag);
@@ -692,10 +709,149 @@ function logPulse(mag) {
   };
   Object.assign(item, xyToGeo(item.x, item.y));
   state.queue.unshift(item);
+  if (trip) trip.pulses++;
   save();
   updateInboxBadge();
   toast(`⚡ Impact logged (${g}g) → review queue`, "alert");
   if (state.settings.tts) Sensors.speak("Hazard logged");
+}
+
+/* ============================================================
+   ROUTE TRIP RECORDER
+   Records the active ride/walk as a live polyline, saves it as a
+   trip with stats, and powers the "Recent trips" history.
+   ============================================================ */
+let trip = null, routeLine = null, savedRouteLine = null;
+
+function startTrip(mode) {
+  trip = { id: uid(), mode, startedAt: Date.now(), endedAt: null, distance: 0, durationSec: 0, pulses: 0, points: [] };
+  if (routeLine && lmap) lmap.removeLayer(routeLine);
+  routeLine = null;
+}
+
+function recordPoint(lat, lng) {
+  if (!trip) return;
+  const pts = trip.points;
+  if (pts.length && typeof L !== "undefined") {
+    const prev = pts[pts.length - 1];
+    trip.distance += L.latLng(prev[0], prev[1]).distanceTo([lat, lng]);
+  }
+  pts.push([lat, lng]);
+  drawActiveRoute();
+}
+
+function drawActiveRoute() {
+  if (!lmap || !trip || !trip.points.length) return;
+  if (!routeLine) routeLine = L.polyline(trip.points, { color: "#ff8a3d", weight: 4, lineCap: "round", opacity: .9 }).addTo(lmap);
+  else routeLine.setLatLngs(trip.points);
+}
+
+function onTrackPosition(lat, lng) {
+  state.me = geoToXY(lat, lng);
+  recordPoint(lat, lng);
+  if (lmap && currentScreen === "map") updateMeLayer();
+  checkProximity();
+}
+
+// Desktop preview: no GPS, so wander along a gentle path to draw a route.
+function startFakeWalk() {
+  const path = [{ x: state.me.x, y: state.me.y }, { x: 38, y: 40 }, { x: 48, y: 50 }, { x: 60, y: 60 }, { x: 70, y: 56 }];
+  let i = 0, step = 0;
+  tracking.fakeWalk = setInterval(() => {
+    const a = path[i], b = path[i + 1];
+    if (!b) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; return; }
+    step += 0.1;
+    const x = a.x + (b.x - a.x) * step, y = a.y + (b.y - a.y) * step;
+    if (step >= 1) { step = 0; i++; }
+    const g = xyToGeo(clamp(x, 3, 97), clamp(y, 3, 97));
+    onTrackPosition(g.lat, g.lng);
+  }, 700);
+}
+
+function endTrip() {
+  const t = trip; trip = null;
+  if (routeLine && lmap) { lmap.removeLayer(routeLine); routeLine = null; }
+  if (!t || t.points.length < 2) { toast("⏹ Tracking stopped"); return; }
+  t.endedAt = Date.now();
+  t.durationSec = Math.max(1, Math.round((t.endedAt - t.startedAt) / 1000));
+  state.trips.unshift(t);
+  state.profile.miles = +(state.profile.miles + t.distance / 1609.34).toFixed(1);
+  save();
+  showTripSummary(t);
+  mascot("Route saved! 🦦");
+}
+
+/* --- formatting + sparkline --- */
+function fmtDist(m) { return m < 950 ? Math.round(m) + " m" : (m / 1000).toFixed(1) + " km"; }
+function fmtDur(s) { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60; return h ? `${h}h ${m}m` : `${m}m ${ss}s`; }
+function tripSpeed(t) { const kmh = (t.distance / 1000) / (t.durationSec / 3600); return isFinite(kmh) && kmh > 0 ? kmh.toFixed(1) + " km/h" : "—"; }
+
+function routeSparkline(points, w = 64, h = 36, color = "var(--brand)") {
+  if (!points || points.length < 2) return `<div class="route-spark empty">—</div>`;
+  const lats = points.map(p => p[0]), lngs = points.map(p => p[1]);
+  const minLa = Math.min(...lats), maxLa = Math.max(...lats), minLo = Math.min(...lngs), maxLo = Math.max(...lngs);
+  const spanLa = (maxLa - minLa) || 1e-6, spanLo = (maxLo - minLo) || 1e-6, pad = 4;
+  const pts = points.map(([la, lo]) => {
+    const x = pad + ((lo - minLo) / spanLo) * (w - 2 * pad);
+    const y = pad + ((maxLa - la) / spanLa) * (h - 2 * pad);
+    return x.toFixed(1) + "," + y.toFixed(1);
+  }).join(" ");
+  return `<svg class="route-spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" preserveAspectRatio="none">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+function showTripSummary(t) {
+  openSheet(`
+    <h2>${MODE_META[t.mode].icon} Trip recorded</h2>
+    <p class="sub">Nice ${t.mode}! Here's how it went.</p>
+    <div class="center" style="margin:10px 0">${routeSparkline(t.points, 240, 96, "var(--accent)")}</div>
+    <div class="grid-3">
+      <div class="mini"><b>${fmtDist(t.distance)}</b><span>distance</span></div>
+      <div class="mini"><b>${fmtDur(t.durationSec)}</b><span>duration</span></div>
+      <div class="mini"><b>${t.pulses}</b><span>pulses</span></div>
+    </div>
+    <div class="mini mt"><b style="font-size:13px">${tripSpeed(t)}</b><span>average speed</span></div>
+    <button class="btn accent mt" data-act="view-trip" data-id="${t.id}">🗺️ View route on map</button>
+    <button class="btn ghost mt" data-act="close-sheet">Done</button>
+  `, "Trip");
+}
+
+function viewTrip(id) {
+  const t = state.trips.find(x => x.id === id);
+  if (!t) return;
+  closeSheet();
+  showScreen("map");
+  setTimeout(() => {
+    if (!lmap) return;
+    if (savedRouteLine) { lmap.removeLayer(savedRouteLine); savedRouteLine = null; }
+    savedRouteLine = L.polyline(t.points, { color: "#1f9d8f", weight: 4, lineCap: "round", opacity: .95 }).addTo(lmap);
+    lmap.fitBounds(savedRouteLine.getBounds().pad(0.3));
+  }, 150);
+  toast(`${MODE_META[t.mode].icon} ${fmtDist(t.distance)} route`);
+}
+
+function deleteTrip(id) {
+  state.trips = state.trips.filter(x => x.id !== id);
+  save();
+  if (currentScreen === "track") renderTrack();
+  toast("🗑️ Trip deleted");
+}
+
+function tripsHtml() {
+  if (!state.trips.length) return "";
+  return `<div class="section-label" style="margin-top:8px">Recent trips · ${state.trips.length}</div>` +
+    state.trips.slice(0, 8).map(t => `
+      <div class="trip-card">
+        <div class="trip-spark">${routeSparkline(t.points)}</div>
+        <div class="meta">
+          <b>${MODE_META[t.mode].icon} ${fmtDist(t.distance)} · ${fmtDur(t.durationSec)}</b>
+          <span>${t.pulses} pulse${t.pulses === 1 ? "" : "s"} logged · ${fmtTime(t.startedAt)}</span>
+        </div>
+        <div class="acts">
+          <button class="round ok" data-act="view-trip" data-id="${t.id}" title="View on map">🗺️</button>
+          <button class="round no" data-act="delete-trip" data-id="${t.id}" title="Delete">✕</button>
+        </div>
+      </div>`).join("");
 }
 
 /* ============================================================
@@ -803,6 +959,8 @@ function renderProfile() {
       <div class="mini"><b>${p.verified}</b><span>reports verified</span></div>
       <div class="mini"><b>${p.carbon.toFixed(1)} kg</b><span>CO₂ offset</span></div>
       <div class="mini"><b>${p.miles} mi</b><span>routes tracked</span></div>
+      <div class="mini"><b>${state.trips.length}</b><span>trips recorded</span></div>
+      <div class="mini"><b>${fmtDist(state.trips.reduce((s, t) => s + (t.distance || 0), 0))}</b><span>total distance</span></div>
     </div>
 
     <div class="section-label" style="margin-top:16px">Medals · ${unlockedMedals().length}/${medals.length}</div>
@@ -1114,6 +1272,10 @@ document.addEventListener("click", (e) => {
     case "demo-sim-ride": closeSheet(); simulateRide(); break;
     case "demo-drop-pin": closeSheet(); if (lmap) { const c = lmap.getCenter(); openCapture(geoToXY(c.lat, c.lng)); } break;
     case "demo-jump": closeSheet(); if (lmap) lmap.flyTo([(GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2, (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2], 13, { duration: .6 }); break;
+
+    /* trips */
+    case "view-trip": viewTrip(d.id); break;
+    case "delete-trip": deleteTrip(d.id); break;
 
     /* pin actions */
     case "confirm-pin": confirmPin(d.id); break;

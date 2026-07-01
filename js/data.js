@@ -110,3 +110,18 @@ const OTTER_LINES = [
   "Another hazard tamed!",
   "You're making Marin safer.",
 ];
+
+// Seed trips so the recorder history isn't empty on first run.
+// points are [lat,lng] samples; distance in meters, duration in seconds.
+const SEED_TRIPS = [
+  {
+    id: "t1", mode: "bike", startedAt: Date.now() - 9.0e7, endedAt: Date.now() - 9.0e7 + 1620e3,
+    distance: 6240, durationSec: 1620, pulses: 3,
+    points: [[37.998, -122.585], [37.992, -122.575], [37.985, -122.560], [37.978, -122.548], [37.972, -122.540]],
+  },
+  {
+    id: "t2", mode: "walk", startedAt: Date.now() - 1.7e8, endedAt: Date.now() - 1.7e8 + 2040e3,
+    distance: 2980, durationSec: 2040, pulses: 0,
+    points: [[37.960, -122.530], [37.957, -122.524], [37.952, -122.520], [37.949, -122.512]],
+  },
+];
