@@ -1,1158 +1,1080 @@
 /* ============================================================
-   app.js — PulsePath application controller.
-   State, navigation, rendering and all feature wiring.
+   app.js — motio application controller.
+   SPA state engine: navigation, rendering, tracking lifecycle,
+   capture, encrypted inbox, community map, civic actions.
+
+   Load order (index.html): civic → crypto → data → sensors →
+   engine → sync → app. Everything is plain globals; no build.
    ============================================================ */
 
-/* ---------------- State ---------------- */
-const STORE_KEY = "pulsepath.v1";
+/* ================= State ================= */
+const STORE_KEY = "motio.v1";
 
 const DEFAULT_STATE = () => ({
   onboarded: false,
   ageConfirmed: false,
-  hazards: SEED_HAZARDS.map(h => ({ ...h })),
-  queue: SEED_QUEUE.map(q => ({ ...q })),
-  filters: { pothole: true, rut: true, debris: true, wildlife: true, flood: true, other: true },
+  waiverAccepted: false,
   settings: {
-    dark: false, radius: 35, threshold: 13.8, voice: false, tts: true,
-    battery: true, mode: "bike", calibrated: false, weather: "clear",
-    mapStyle: "auto", offline: false,
+    dark: false,
+    mode: "bike",          // bike | walk
+    autoUpload: true,      // 10-minute loop on/off
+    lowPower: false,       // disables AudioContext (sonar) factor
+    tts: true,             // proximity voice alerts
+    radiusM: 120,          // proximity alert radius (meters)
+    offline: false,        // offline tiles mode
   },
-  profile: { name: "River Rider", photo: null, mapped: 3, verified: 5, carbon: 2.4, emails: 0, miles: 42 },
-  district: { miles: 1284 },
-  trips: SEED_TRIPS.map(t => ({ ...t })),
-  me: { x: 41, y: 44 },
+  profile: { name: "Novato commuter", points: 0, mapped: 0, cleared: 0, emails: 0 },
+  hazards: SEED_HAZARDS.map(h => ({ ...h })),
+  filters: { pothole: true, manhole: true, rut: true, branch: true, oil: true, dumping: true },
+  history: [],             // { t, icon, text }
 });
 
 let state = load();
-
 function load() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw) return Object.assign(DEFAULT_STATE(), JSON.parse(raw));
+    if (raw) {
+      const s = Object.assign(DEFAULT_STATE(), JSON.parse(raw));
+      s.settings = Object.assign(DEFAULT_STATE().settings, s.settings);
+      return s;
+    }
   } catch (e) {}
   return DEFAULT_STATE();
 }
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {} }
 
-/* ---------------- Tiny DOM helpers ---------------- */
+/* ================= Helpers ================= */
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
-const fmtTime = (ts) => {
+const uid = () => "m" + Math.random().toString(36).slice(2, 10);
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const fmtAgo = (ts) => {
   const d = Math.floor((Date.now() - ts) / 1000);
   if (d < 60) return "just now";
   if (d < 3600) return Math.floor(d / 60) + "m ago";
   if (d < 86400) return Math.floor(d / 3600) + "h ago";
   return Math.floor(d / 86400) + "d ago";
 };
-const sevColors = ["#6a994e", "#a7c957", "#f2c14e", "#ff8a3d", "#e4572e"];
-const sevColor = (n) => sevColors[clamp(n, 1, 5) - 1];
-const sevLabel = (n) => ["", "Minor", "Low", "Moderate", "High", "Severe"][clamp(n, 1, 5)];
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const uid = () => "x" + Math.random().toString(36).slice(2, 9);
-
-/* ---------------- Navigation ---------------- */
-let currentScreen = "home";
-const TAB_SCREENS = ["home", "map", "inbox", "profile"];
-
-function showScreen(name) {
-  currentScreen = name;
-  $$(".screen").forEach(s => s.classList.toggle("active", s.id === "screen-" + name));
-  $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
-  // back arrow for sub-screens
-  $("#backBtn").style.display = TAB_SCREENS.includes(name) ? "none" : "grid";
-  renderScreen(name);
-  $(".screens").scrollTop = 0;
-  const sc = $("#screen-" + name); if (sc) sc.scrollTop = 0;
+const sevColors = ["#5f8a5f", "#8a9a4e", "#e0902f", "#cf6b3a", "#d64d3f"];
+const sevColor = (n) => sevColors[Math.max(1, Math.min(5, n)) - 1];
+const sevLabel = (n) => ["", "Minor", "Low", "Moderate", "High", "Severe"][Math.max(1, Math.min(5, n))];
+function haversineM(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+function pushHistory(icon, text) {
+  state.history.unshift({ t: Date.now(), icon, text });
+  state.history = state.history.slice(0, 30);
+  save();
 }
 
-function renderScreen(name) {
-  ({
-    home: renderHome, map: renderMap, track: renderTrack,
-    inbox: renderInbox, profile: renderProfile, settings: renderSettings,
-  }[name] || (() => {}))();
-}
+/* ================= Feedback (vibrate → chime → flash fallbacks) ================= */
+const Feedback = {
+  _ctx: null,
+  // AudioContext for chimes: reuse the tracking context when present;
+  // else lazily create (may start suspended off-gesture — then we fall
+  // through the chain to the visual flash).
+  ctx() {
+    if (Sensors._audioCtx) return Sensors._audioCtx;
+    if (!this._ctx) {
+      try { const AC = window.AudioContext || window.webkitAudioContext; this._ctx = new AC(); } catch (e) {}
+    }
+    return this._ctx;
+  },
+  tone(freq = 880, ms = 160, vol = 0.4) {
+    const ctx = this.ctx();
+    if (!ctx) return false;
+    if (ctx.state === "suspended") { ctx.resume().catch(() => {}); if (ctx.state === "suspended") return false; }
+    try {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "square"; o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(ctx.destination);
+      o.start();
+      o.stop(ctx.currentTime + ms / 1000);
+      return true;
+    } catch (e) { return false; }
+  },
+  flash() {
+    const d = $("#device");
+    d.classList.remove("flash-alert");
+    void d.offsetWidth; // restart animation
+    d.classList.add("flash-alert");
+  },
+  // The spec's fallback chain: vibrate → audio chime → visual flash.
+  alert(pattern = [90, 60, 90]) {
+    if (Sensors.buzz(pattern)) return "vibrate";
+    if (this.tone(880, 150) ) { setTimeout(() => this.tone(660, 150), 200); return "tone"; }
+    this.flash();
+    return "flash";
+  },
+};
 
-/* ---------------- Toast + mascot ---------------- */
-function toast(msg, kind = "", ms = 2600) {
-  const w = $("#toasts");
+/* ================= Toasts ================= */
+function toast(msg, kind = "", ms = 2800) {
   const el = document.createElement("div");
   el.className = "toast " + kind;
   el.innerHTML = msg;
-  w.appendChild(el);
-  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 300); }, ms);
-}
-function mascot(line) {
-  const m = $("#mascot");
-  m.querySelector("b").textContent = line || OTTER_LINES[Math.floor(Math.random() * OTTER_LINES.length)];
-  m.classList.add("show");
-  setTimeout(() => m.classList.remove("show"), 2600);
+  $("#toasts").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, ms - 300);
+  setTimeout(() => el.remove(), ms);
 }
 
-/* ---------------- Theme + mode pill ---------------- */
+/* ================= Theme ================= */
 function applyTheme() {
-  document.documentElement.setAttribute("data-theme", state.settings.dark ? "dark" : "light");
+  document.documentElement.dataset.theme = state.settings.dark ? "dark" : "";
   $("#darkIcon").textContent = state.settings.dark ? "🌙" : "☀️";
 }
-const MODE_META = {
-  bike:   { icon: "🚲", label: "Bike Mode" },
-  walk:   { icon: "🚶", label: "Walk Mode" },
-  patrol: { icon: "📷", label: "Patrol Mode" },
-  drive:  { icon: "🚗", label: "Drive Mode" },
-};
-function refreshModePill() {
-  const m = MODE_META[state.settings.mode];
-  $("#modePill").innerHTML = `${m.icon} ${m.label}`;
+
+/* ================= Navigation ================= */
+let currentScreen = "home";
+function showScreen(name) {
+  if (Track.active && name !== "track") { toast("⛔ End tracking first — battery saver keeps only telemetry alive", "warn"); return; }
+  currentScreen = name;
+  $$(".screen").forEach(s => s.classList.toggle("active", s.id === "screen-" + name));
+  $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  $("#backBtn").style.display = "none";
+  renderScreen(name);
+}
+function renderScreen(name) {
+  if (name === "home") renderHome();
+  else if (name === "map") renderMap();
+  else if (name === "inbox") renderInbox();
+  else if (name === "settings") renderSettings();
 }
 
-/* ============================================================
-   HOME
-   ============================================================ */
+/* ================= HOME ================= */
 function renderHome() {
   const p = state.profile;
-  const totalPins = state.hazards.length;
-  const unv = state.hazards.filter(h => h.status === "unverified").length;
-  const goal = 50, contrib = p.mapped + p.verified;
-  const w = state.settings.weather;
-  const wo = WEATHER_STATES.find(x => x.id === w);
-
+  const pendingNote = Sync.configured
+    ? (state.settings.autoUpload ? "auto-upload every 10 min" : "manual review mode")
+    : "sync unavailable — working locally";
   $("#screen-home").innerHTML = `
-    <div class="card hero">
-      <span class="otter">🦦</span>
-      <h2>Hey ${p.name.split(" ")[0]} 👋</h2>
-      <p>Marin's roads & trails are a little safer thanks to you.</p>
-      <div class="stat-row">
-        <div class="stat"><b>${p.mapped}</b><span>hazards mapped</span></div>
-        <div class="stat"><b>${p.verified}</b><span>reports verified</span></div>
-        <div class="stat"><b>${p.carbon.toFixed(1)}kg</b><span>CO₂ offset</span></div>
-      </div>
-      <div class="progress"><i style="width:${Math.min(100, contrib / goal * 100)}%"></i></div>
-      <p style="margin-top:8px;font-size:11px">${contrib}/${goal} to your next milestone</p>
+    <h1>Good ${new Date().getHours() < 12 ? "morning" : (new Date().getHours() < 17 ? "afternoon" : "evening")}, ${esc(p.name)}</h1>
+    <p class="sub">Novato's community road &amp; trail hazard network.</p>
+
+    <div class="grid-3">
+      <div class="stat"><b>${p.mapped}</b><span>hazards mapped</span></div>
+      <div class="stat"><b>${p.cleared}</b><span>hazards cleared</span></div>
+      <div class="stat"><b>${p.points}</b><span>civic points</span></div>
     </div>
 
-    <button class="btn accent" data-act="go-track" style="margin-bottom:14px;font-size:15px;padding:16px">
-      ▶  Start ${MODE_META[state.settings.mode].label} tracking
-    </button>
+    <button class="btn mt" data-act="start-track" style="padding:17px;font-size:16px">▶ Start tracking</button>
+    <p class="muted center" style="margin-top:6px">${state.settings.mode === "bike" ? "Bike" : "Walk"} mode · sensor fusion arms between 6–22 mph · ${pendingNote}</p>
 
-    <div class="section-label">Choose your mode</div>
-    <div class="mode-grid">
-      ${Object.entries(MODE_META).map(([k, m]) => `
-        <button class="mode-card ${state.settings.mode === k ? "sel" : ""}" data-act="set-mode" data-mode="${k}">
-          <span class="emoji">${m.icon}</span>
-          <b>${m.label}</b>
-          <span>${modeBlurb(k)}</span>
-        </button>`).join("")}
+    <div class="card mt" id="homeZoneCard">
+      <h3>📍 Zone awareness</h3>
+      <p class="muted" id="homeZoneText">Checking your location against Novato's documented risk corridors…</p>
     </div>
 
-    <div class="grid-2 mt">
-      <div class="mini"><b>${totalPins}</b><span>active hazard pins</span></div>
-      <div class="mini"><b>${unv}</b><span>need verification near you</span></div>
+    <div class="card">
+      <h3>Recent activity</h3>
+      ${state.history.length
+        ? state.history.slice(0, 5).map(h => `<div class="list-row"><span>${h.icon}</span><span style="flex:1">${esc(h.text)}</span><span class="muted">${fmtAgo(h.t)}</span></div>`).join("")
+        : `<p class="muted">Nothing yet. Start tracking or capture a hazard with the ＋ button.</p>`}
     </div>
-
-    <div class="card mt" style="background:linear-gradient(135deg,var(--sky),#2f80ed);color:#fff;border:none">
-      <h3 style="color:#fff">🌍 District Progress</h3>
-      <p class="sub" style="color:rgba(255,255,255,.85)">Mapped by all PulsePath users across the district</p>
-      <div style="font-size:30px;font-weight:800;margin-top:6px">${state.district.miles.toLocaleString()} mi</div>
-      <div class="kpi-bar"><i style="width:64%;background:#fff"></i></div>
-      <p style="font-size:11px;margin-top:6px;opacity:.85">64% toward the 2,000 mi county goal</p>
-    </div>
-
-    <div class="card" data-act="cycle-weather" style="cursor:pointer">
-      <div class="flex"><span style="font-size:26px">${wo.icon}</span>
-        <div><h3>${wo.label}</h3><p class="sub">${wo.note} · tap to preview overlay</p></div></div>
-    </div>
-
-    <div class="card" data-act="open-clearing">
-      <div class="flex"><span style="font-size:26px">🧹</span>
-        <div><h3>Safe Clearing Guide</h3><p class="sub">How to safely move a loose branch (13+)</p></div></div>
-    </div>
-
-    <div class="card" data-act="go-settings">
-      <div class="flex"><span style="font-size:26px">⚙️</span>
-        <div><h3>Settings & data export</h3><p class="sub">Proximity, battery saver, dark mode, CSV / GeoJSON</p></div></div>
-    </div>
-
-    <p class="center muted" style="font-size:11px;margin-top:8px">PulsePath · prototype build · sensors simulate on desktop</p>
   `;
-}
-function modeBlurb(k) {
-  return { bike: "Pulse impact logging", walk: "Health-app steps", patrol: "Camera anomaly watch", drive: "CO₂ commute nudge" }[k];
-}
-
-/* ============================================================
-   MAP
-   ============================================================ */
-function visibleHazards() {
-  return state.hazards.filter(h => state.filters[h.cat]);
-}
-function clusterHazards(list) {
-  const used = new Set(), clusters = [];
-  for (let i = 0; i < list.length; i++) {
-    if (used.has(i)) continue;
-    const group = [list[i]]; used.add(i);
-    for (let j = i + 1; j < list.length; j++) {
-      if (used.has(j)) continue;
-      // Bundle near-duplicate reports of the same hazard (~same spot).
-      if (list[i].cat === list[j].cat && dist(list[i], list[j]) < 2.5) { group.push(list[j]); used.add(j); }
-    }
-    clusters.push(group);
-  }
-  return clusters;
-}
-/* ============================================================
-   Leaflet map subsystem
-   Real OSM/topo/satellite tiles when online, an IndexedDB tile
-   cache that fills in as you pan, and an online/offline toggle.
-   The app's internal x/y model is bridged to lat/lng only here.
-   ============================================================ */
-let lmap = null, markerLayer = null, meMarker = null, radiusCircle = null;
-let currentLayer = null, currentResolved = null, cachedTiles = 0;
-const BLANK_TILE = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
-
-function isOffline() { return state.settings.offline || !navigator.onLine; }
-
-function resolveStyle() {
-  const s = state.settings.mapStyle;
-  if (s !== "auto") return s;
-  if (!lmap) return "street";
-  const c = lmap.getCenter();
-  return isOpenSpace(c.lat, c.lng) ? "topo" : "street";
+  // Async zone check for the home card.
+  Sensors.getPosition().then(pos => {
+    const el = $("#homeZoneText");
+    if (!el) return;
+    if (!pos) { el.textContent = "Location unavailable. Zone alerts activate while tracking."; return; }
+    const z = zoneForPoint(pos.lat, pos.lng);
+    el.innerHTML = z
+      ? `⚠️ You're inside a documented risk corridor:<br><b>${esc(z.title)}</b><br>Known issue: ${esc(z.riskType)}. Sensor sensitivity is raised here.`
+      : "You're outside Novato's documented risk corridors. All 7 zones are outlined on the map.";
+  });
 }
 
-// TileLayer that serves cached tiles when offline and quietly caches tiles
-// (via a CORS fetch) as they load when online.
-const CachingTileLayer = (typeof L !== "undefined") ? L.TileLayer.extend({
-  createTile(coords, done) {
-    const tile = document.createElement("img");
-    tile.alt = "";
-    const key = this.options.styleKey + "/" + coords.z + "/" + coords.x + "/" + coords.y;
-    const url = this.getTileUrl(coords);
-    const fromCache = () => tileGet(key).then(data => {
-      if (data) { tile.src = data; } else { tile.classList.add("tile-missing"); tile.src = BLANK_TILE; }
-      done(null, tile);
-    }).catch(() => { tile.classList.add("tile-missing"); tile.src = BLANK_TILE; done(null, tile); });
-    if (isOffline()) { fromCache(); return tile; }
-    tile.onload = () => { done(null, tile); maybeCacheTile(key, url); };
-    tile.onerror = fromCache;
-    tile.src = url;
-    return tile;
+/* ================= MAP ================= */
+const MapCtl = {
+  map: null, tiles: null, markers: [], zoneRects: [], meMarker: null,
+  showZones: true,
+
+  /* ---- IndexedDB tile cache (offline mode fills as you pan) ---- */
+  BLANK_TILE: "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==",
+  _tileDB: null,
+  tileDB() {
+    return new Promise((resolve) => {
+      if (this._tileDB) return resolve(this._tileDB);
+      if (!("indexedDB" in window)) return resolve(null);
+      const req = indexedDB.open("motio-tiles", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("tiles");
+      req.onsuccess = () => { this._tileDB = req.result; resolve(this._tileDB); };
+      req.onerror = () => resolve(null);
+    });
   },
-}) : null;
+  async tileGet(key) {
+    const db = await this.tileDB(); if (!db) return null;
+    return new Promise((res) => {
+      const rq = db.transaction("tiles").objectStore("tiles").get(key);
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => res(null);
+    });
+  },
+  async tilePut(key, dataURL) {
+    const db = await this.tileDB(); if (!db) return;
+    try { db.transaction("tiles", "readwrite").objectStore("tiles").put(dataURL, key); } catch (e) {}
+  },
 
-function buildLayer(styleKey) {
-  const cfg = TILE_LAYERS[styleKey] || TILE_LAYERS.street;
-  return new CachingTileLayer(cfg.url, {
-    styleKey, attribution: cfg.attribution, maxZoom: cfg.maxZoom || 19,
-    subdomains: cfg.subdomains || "abc",
-  });
-}
+  isOffline() { return state.settings.offline || !navigator.onLine; },
 
-function setTileLayer() {
-  if (!lmap) return;
-  const resolved = resolveStyle();
-  if (resolved === currentResolved && currentLayer) return;
-  if (currentLayer) lmap.removeLayer(currentLayer);
-  currentLayer = buildLayer(resolved);
-  currentLayer.addTo(lmap);
-  currentLayer.bringToBack();
-  currentResolved = resolved;
-}
+  init() {
+    if (this.map) return;
+    const host = $("#leafletHost");
+    if (!host) return;
+    this.map = L.map(host, {
+      center: [NOVATO_CENTER.lat, NOVATO_CENTER.lng],
+      zoom: DEFAULT_ZOOM,
+      zoomControl: false,
+      attributionControl: true,
+      maxBounds: [[NOVATO_VIEW.minLat - .06, NOVATO_VIEW.minLng - .08], [NOVATO_VIEW.maxLat + .06, NOVATO_VIEW.maxLng + .08]],
+    });
 
-function initMap() {
-  const lat = (GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2;
-  const lng = (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2;
-  lmap = L.map("leafletMap", { zoomControl: false, attributionControl: true }).setView([lat, lng], 13);
-  markerLayer = L.layerGroup().addTo(lmap);
-  setTileLayer();
-  lmap.on("click", (e) => openCapture(geoToXY(e.latlng.lat, e.latlng.lng)));
-  lmap.on("moveend zoomend", () => {
-    if (state.settings.mapStyle === "auto") setTileLayer();
-    refreshMarkers(); updateMapStatus();
-  });
-  openTileDB().then(() => tileCount().then(n => { cachedTiles = n; updateMapStatus(); }));
-}
+    // Caching tile layer: serves from IndexedDB when offline, caches
+    // (CORS-permitting) tiles while online.
+    const self = this;
+    const CachingLayer = L.TileLayer.extend({
+      createTile(coords, done) {
+        const img = document.createElement("img");
+        const key = `${coords.z}/${coords.x}/${coords.y}`;
+        const url = L.Util.template(TILE_LAYER.url, coords);
+        img.alt = "";
+        if (self.isOffline()) {
+          self.tileGet(key).then(data => { img.src = data || self.BLANK_TILE; done(null, img); });
+        } else {
+          img.crossOrigin = "anonymous";
+          img.onload = () => {
+            done(null, img);
+            try {
+              const c = document.createElement("canvas");
+              c.width = img.naturalWidth; c.height = img.naturalHeight;
+              c.getContext("2d").drawImage(img, 0, 0);
+              self.tilePut(key, c.toDataURL("image/png"));
+            } catch (e) { /* tainted or quota — display still fine */ }
+          };
+          img.onerror = () => self.tileGet(key).then(data => { img.src = data || self.BLANK_TILE; done(null, img); });
+          img.src = url;
+        }
+        return img;
+      },
+    });
+    this.tiles = new CachingLayer(TILE_LAYER.url, { maxZoom: TILE_LAYER.maxZoom, attribution: TILE_LAYER.attribution });
+    this.tiles.addTo(this.map);
 
-const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+    // Zone rectangles: the 7 documented Novato risk corridors.
+    this.drawZones();
 
-function pinIcon(h) {
-  const c = CATEGORIES[h.cat];
-  return L.divIcon({ className: "hz-pin", html: `<div class="bubble ${h.status}" style="background:${c.color}"><span>${c.icon}</span></div>`, iconSize: [34, 34], iconAnchor: [17, 33] });
-}
-function clusterIcon(group) {
-  const c = CATEGORIES[group[0].cat];
-  return L.divIcon({ className: "hz-pin", html: `<div class="bubble cluster" style="background:${c.color}"><span>${group.length}</span></div>`, iconSize: [40, 40], iconAnchor: [20, 20] });
-}
+    this.map.on("zoomend moveend", () => { this.refreshPins(); this.updateZoneBanner(); });
+    this.map.on("click", (e) => openManualReport({ lat: e.latlng.lat, lng: e.latlng.lng }));
+    this.refreshPins();
+    this.updateZoneBanner();
+  },
 
-// Zoom-aware clustering: group same-category pins within ~44px on screen.
-function refreshMarkers() {
-  if (!lmap || !markerLayer) return;
-  markerLayer.clearLayers();
-  const pts = visibleHazards().map(h => ({ h, p: lmap.latLngToContainerPoint([h.lat, h.lng]) }));
-  const used = new Set();
-  for (let i = 0; i < pts.length; i++) {
-    if (used.has(i)) continue;
-    const group = [pts[i].h]; used.add(i);
-    for (let j = i + 1; j < pts.length; j++) {
-      if (used.has(j)) continue;
-      if (pts[i].h.cat === pts[j].h.cat && pts[i].p.distanceTo(pts[j].p) < 44) { group.push(pts[j].h); used.add(j); }
+  // Full unmount for OLED power mode: destroy the Leaflet instance and
+  // empty the host node so the GPU/RAM cost drops to zero.
+  destroy() {
+    if (!this.map) return;
+    try { this.map.remove(); } catch (e) {}
+    this.map = null; this.tiles = null; this.markers = []; this.zoneRects = []; this.meMarker = null;
+    const host = $("#leafletHost");
+    if (host) host.innerHTML = "";
+  },
+
+  drawZones() {
+    this.zoneRects.forEach(r => r.remove());
+    this.zoneRects = [];
+    if (!this.showZones || !this.map) return;
+    for (const [id, z] of Object.entries(NOVATO_HAZARD_ZONES)) {
+      const rect = L.rectangle(
+        [[z.latMin, z.lngMin], [z.latMax, z.lngMax]],
+        { color: "#c07a4f", weight: 1, dashArray: "4 4", fillColor: "#c07a4f", fillOpacity: 0.06, interactive: false });
+      rect.addTo(this.map);
+      this.zoneRects.push(rect);
     }
-    if (group.length > 1) {
-      const ids = group.map(g => g.id).join(",");
-      L.marker([avg(group.map(g => g.lat)), avg(group.map(g => g.lng))], { icon: clusterIcon(group) })
-        .addTo(markerLayer).on("click", () => openCluster(ids));
-    } else {
-      const h = group[0];
-      L.marker([h.lat, h.lng], { icon: pinIcon(h) }).addTo(markerLayer).on("click", () => openPin(h.id));
+  },
+
+  visibleHazards() {
+    return allHazards().filter(h => state.filters[h.cat]);
+  },
+
+  // Zoom-aware clustering: group pins closer than 44 px at current zoom.
+  clusters() {
+    const list = this.visibleHazards();
+    if (!this.map) return [];
+    const groups = [];
+    const used = new Set();
+    for (const h of list) {
+      if (used.has(h.id)) continue;
+      const g = [h]; used.add(h.id);
+      const p1 = this.map.latLngToContainerPoint([h.lat, h.lng]);
+      for (const o of list) {
+        if (used.has(o.id)) continue;
+        const p2 = this.map.latLngToContainerPoint([o.lat, o.lng]);
+        if (p1.distanceTo(p2) < 44) { g.push(o); used.add(o.id); }
+      }
+      groups.push(g);
     }
-  }
-  updateMeLayer();
+    return groups;
+  },
+
+  refreshPins() {
+    if (!this.map) return;
+    this.markers.forEach(m => m.remove());
+    this.markers = [];
+    for (const group of this.clusters()) {
+      if (group.length === 1) {
+        const h = group[0];
+        const c = CATEGORIES[h.cat];
+        const icon = L.divIcon({
+          className: "",
+          html: `<div class="pin ${h.status}" style="background:${c.color}"><span>${c.icon}</span></div>`,
+          iconSize: [30, 30], iconAnchor: [15, 28],
+        });
+        const m = L.marker([h.lat, h.lng], { icon }).addTo(this.map);
+        m.on("click", () => { this.map.flyTo([h.lat, h.lng], Math.max(this.map.getZoom(), 16), { duration: .5 }); openPin(h.id); });
+        this.markers.push(m);
+      } else {
+        const lat = group.reduce((s, h) => s + h.lat, 0) / group.length;
+        const lng = group.reduce((s, h) => s + h.lng, 0) / group.length;
+        const icon = L.divIcon({ className: "", html: `<div class="cluster">${group.length}</div>`, iconSize: [34, 34], iconAnchor: [17, 17] });
+        const m = L.marker([lat, lng], { icon }).addTo(this.map);
+        const ids = group.map(h => h.id);
+        m.on("click", () => openCluster(ids));
+        this.markers.push(m);
+      }
+    }
+  },
+
+  updateMe(pos) {
+    if (!this.map) return;
+    if (!this.meMarker) {
+      const icon = L.divIcon({ className: "", html: `<div style="width:16px;height:16px;border-radius:50%;background:#4f7166;border:3px solid #fff;box-shadow:0 0 0 4px rgba(79,113,102,.25)"></div>`, iconSize: [16, 16], iconAnchor: [8, 8] });
+      this.meMarker = L.marker([pos.lat, pos.lng], { icon }).addTo(this.map);
+    } else this.meMarker.setLatLng([pos.lat, pos.lng]);
+  },
+
+  updateZoneBanner() {
+    const el = $("#zoneBanner");
+    if (!el || !this.map) return;
+    const c = this.map.getCenter();
+    const z = zoneForPoint(c.lat, c.lng);
+    el.style.display = z ? "block" : "none";
+    if (z) el.innerHTML = `<b>⚠️ ${esc(z.riskType)}</b> — ${esc(z.title)}`;
+  },
+};
+
+function allHazards() {
+  // Local (persisted) + remote (community pull, session-only), deduped.
+  const seen = new Set(state.hazards.map(h => h.id));
+  return state.hazards.concat((window._remoteHazards || []).filter(h => !seen.has(h.id)));
 }
 
-function updateMeLayer() {
-  if (!lmap) return;
-  const g = xyToGeo(state.me.x, state.me.y);
-  if (!meMarker) {
-    meMarker = L.marker([g.lat, g.lng], { icon: L.divIcon({ className: "me-icon", html: `<div class="me-blip"></div>`, iconSize: [18, 18], iconAnchor: [9, 9] }), interactive: false, zIndexOffset: 1000 }).addTo(lmap);
-    radiusCircle = L.circle([g.lat, g.lng], { radius: state.settings.radius, color: "#4ea8de", weight: 1.5, dashArray: "5 5", fillColor: "#4ea8de", fillOpacity: .08, interactive: false }).addTo(lmap);
-  } else {
-    meMarker.setLatLng([g.lat, g.lng]);
-    radiusCircle.setLatLng([g.lat, g.lng]).setRadius(state.settings.radius);
-  }
-}
-
-/* ---- IndexedDB tile cache ---- */
-let _tdb = null;
-function openTileDB() {
-  if (_tdb) return Promise.resolve(_tdb);
-  return new Promise((resolve) => {
-    if (!("indexedDB" in window)) return resolve(null);
-    const req = indexedDB.open("pulsepath-tiles", 1);
-    req.onupgradeneeded = () => req.result.createObjectStore("tiles");
-    req.onsuccess = () => { _tdb = req.result; resolve(_tdb); };
-    req.onerror = () => resolve(null);
-  });
-}
-function tileGet(key) {
-  return openTileDB().then(db => db ? new Promise((res) => {
-    const r = db.transaction("tiles").objectStore("tiles").get(key);
-    r.onsuccess = () => res(r.result || null); r.onerror = () => res(null);
-  }) : null);
-}
-function tilePut(key, data) {
-  return openTileDB().then(db => { if (db) db.transaction("tiles", "readwrite").objectStore("tiles").put(data, key); });
-}
-function tileCount() {
-  return openTileDB().then(db => db ? new Promise((res) => {
-    const r = db.transaction("tiles").objectStore("tiles").count();
-    r.onsuccess = () => res(r.result || 0); r.onerror = () => res(0);
-  }) : 0);
-}
-function blobToDataURL(blob) {
-  return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });
-}
-async function maybeCacheTile(key, url) {
-  if (isOffline()) return;
-  try {
-    if (await tileGet(key)) return;
-    const res = await fetch(url, { mode: "cors" });
-    if (!res.ok) return;
-    await tilePut(key, await blobToDataURL(await res.blob()));
-    cachedTiles++; updateMapStatus();
-  } catch (e) { /* CORS / network — skip caching, display unaffected */ }
-}
-
-/* ---- Map screen render (persistent Leaflet root + overlay) ---- */
 function renderMap() {
-  const screen = $("#screen-map");
-  if (!$("#leafletMap")) {
-    screen.innerHTML = `<div class="map-wrap"><div id="leafletMap"></div><div id="mapOverlay"></div></div>`;
-    if (typeof L !== "undefined") initMap();
-  }
-  renderMapOverlay();
-  if (lmap) setTimeout(() => { lmap.invalidateSize(); refreshMarkers(); drawActiveRoute(); }, 0);
-}
-
-function renderMapOverlay() {
-  const ov = $("#mapOverlay"); if (!ov) return;
-  const wo = WEATHER_STATES.find(x => x.id === state.settings.weather);
-  const filterChips = Object.entries(CATEGORIES).map(([k, c]) => `
-    <button class="chip ${state.filters[k] ? "" : "off"}" data-act="toggle-filter" data-cat="${k}">
-      <span class="dot" style="background:${c.color}"></span>${c.label}</button>`).join("");
-  ov.innerHTML = `
-    <div class="map-search">
-      <input id="mapSearch" placeholder="Search a place or address…" autocomplete="off" enterkeyhint="search">
-      <button class="icon-btn" data-act="map-search" title="Search">🔍</button>
-    </div>
-    <div class="map-top">${filterChips}</div>
-    <button class="chip weather-badge" data-act="cycle-weather">${wo.icon} ${wo.label}</button>
-    <div class="map-rightctrl">
-      <button class="icon-btn mapbtn" data-act="map-style" title="Map style">🗺️</button>
-      <button class="icon-btn mapbtn" data-act="map-offline" title="Online / offline">${isOffline() ? "📴" : "📶"}</button>
-      <button class="icon-btn mapbtn" data-act="map-zoom-in" title="Zoom in">＋</button>
-      <button class="icon-btn mapbtn" data-act="map-zoom-out" title="Zoom out">－</button>
-      <button class="icon-btn mapbtn" data-act="map-recenter" title="Recenter on me">📍</button>
-      <button class="icon-btn mapbtn" data-act="open-demo" title="Demo tools">⋯</button>
-    </div>
-    <div class="map-legend" id="mapStatus"></div>`;
-  updateMapStatus();
-}
-
-function updateMapStatus() {
-  const el = $("#mapStatus"); if (!el) return;
-  const styleLabel = { auto: "Auto", street: "Street", topo: "Topo", satellite: "Satellite" }[state.settings.mapStyle];
-  const resolved = currentResolved || resolveStyle();
-  el.innerHTML = `${isOffline() ? "📴 Offline" : "📶 Online"} · ${styleLabel}${state.settings.mapStyle === "auto" ? " → " + resolved : ""} · ${visibleHazards().length} pins · 🧩 ${cachedTiles}`;
-}
-
-/* ---- Map control actions ---- */
-const MAP_STYLES = ["auto", "street", "topo", "satellite"];
-function cycleMapStyle() {
-  const i = MAP_STYLES.indexOf(state.settings.mapStyle);
-  state.settings.mapStyle = MAP_STYLES[(i + 1) % MAP_STYLES.length];
-  save(); setTileLayer(); renderMapOverlay();
-  toast(`🗺️ Map: ${state.settings.mapStyle}`);
-}
-function toggleOffline() {
-  state.settings.offline = !state.settings.offline;
-  save();
-  if (currentLayer && lmap) { lmap.removeLayer(currentLayer); currentLayer = null; currentResolved = null; setTileLayer(); }
-  renderMapOverlay();
-  toast(state.settings.offline ? "📴 Offline — using cached tiles" : "📶 Back online");
-}
-function recenterMap() { locateMe(); }
-async function doMapSearch() {
-  const inp = $("#mapSearch"); if (!inp || !lmap) return;
-  const q = inp.value.trim(); if (!q) return;
-  if (isOffline()) { toast("📴 Search needs a connection"); return; }
-  toast("🔍 Searching…");
-  try {
-    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`, { headers: { "Accept": "application/json" } });
-    const j = await r.json();
-    if (j && j[0]) { lmap.flyTo([+j[0].lat, +j[0].lon], 15, { duration: .8 }); toast(`📍 ${j[0].display_name.split(",")[0]}`, "good"); }
-    else toast("No results for that place");
-  } catch (e) { toast("Search unavailable here (try served over http)"); }
-}
-function openDemoMenu() {
-  openSheet(`
-    <h2>⋯ Demo / preview tools</h2>
-    <p class="sub">Handy on desktop where real sensors aren't available. Hidden from the main UI so the app stays clean.</p>
-    <button class="btn mt" data-act="demo-sim-ride">🛰️ Simulate a ride (auto-logs + proximity)</button>
-    <button class="btn ghost mt" data-act="demo-drop-pin">📌 Drop a test report at map center</button>
-    <button class="btn ghost mt" data-act="demo-jump">🗺️ Jump to Marin area</button>
-  `, "Demo");
-}
-
-function openPin(id) {
-  const h = state.hazards.find(x => x.id === id);
-  if (!h) return;
-  const c = CATEGORIES[h.cat];
-  if (lmap && currentScreen === "map") lmap.flyTo([h.lat, h.lng], Math.max(lmap.getZoom(), 16), { duration: .6 });
-  const d = (dist(state.me, h) * 150).toFixed(0); // ~150m per map unit
-  openSheet(`
-    <div class="flex" style="gap:14px">
-      <div class="inbox-item" style="margin:0;border:none;padding:0">
-        <div class="thumb" style="width:60px;height:60px;background:${c.color}22">${c.icon}</div>
-      </div>
-      <div style="flex:1">
-        <h2>${c.label}</h2>
-        <div class="sub">${h.note || c.hint}</div>
-        <div class="tag-list">
-          <span class="badge ${h.status === "verified" ? "ver" : "unv"}">${h.status}</span>
-          <span class="badge" style="background:${sevColor(h.sev)}22;color:${sevColor(h.sev)}">Sev ${h.sev} · ${sevLabel(h.sev)}</span>
+  const scr = $("#screen-map");
+  if (!$("#mapWrap", scr)) {
+    scr.innerHTML = `
+      <div id="mapWrap">
+        <div id="leafletHost"></div>
+        <div class="map-status">
+          <div class="zone-banner" id="zoneBanner" style="display:none"></div>
         </div>
-      </div>
-    </div>
-    <div class="grid-3 mt">
-      <div class="mini"><b>${h.votes}</b><span>confirms</span></div>
-      <div class="mini"><b>${d}m</b><span>away</span></div>
-      <div class="mini"><b>${fmtTime(h.createdAt)}</b><span>reported</span></div>
-    </div>
-    <div class="mini" style="margin-top:12px"><b style="font-size:13px">📍 ${h.lat}, ${h.lng}</b><span>Auto-GPS tagged</span></div>
-    <div class="btn-row mt">
-      <button class="btn" data-act="confirm-pin" data-id="${h.id}">✅ Still here</button>
-      <button class="btn ghost" data-act="speak-pin" data-id="${h.id}">🔊 Read aloud</button>
-    </div>
-    <div class="btn-row mt">
-      <button class="btn accent" data-act="draft-email" data-id="${h.id}">✉️ Draft city email</button>
-      <button class="btn ghost" data-act="rate-pin" data-id="${h.id}">⭐ Rate severity</button>
-    </div>
-    ${h.cat === "debris" ? `<button class="btn ghost mt" data-act="open-clearing">🧹 Safe clearing guide</button>` : ""}
-    <button class="btn danger mt" data-act="delete-pin" data-id="${h.id}">🗑️ Remove pin</button>
-  `, c.label);
-}
-
-function openCluster(ids) {
-  const idSet = ids.split(",");
-  const items = state.hazards.filter(h => idSet.includes(h.id));
-  const cat = items[0] ? items[0].cat : "other";
-  if (lmap && currentScreen === "map" && items.length) {
-    lmap.flyToBounds(L.latLngBounds(items.map(h => [h.lat, h.lng])).pad(0.6), { maxZoom: 17, duration: .6 });
-  }
-  openSheet(`
-    <h2>${CATEGORIES[cat].icon} ${CATEGORIES[cat].label} cluster</h2>
-    <p class="sub">${items.length} reports of the same hazard bundled into one map pin to keep things tidy.</p>
-    ${items.map(h => `
-      <div class="inbox-item" data-act="open-pin" data-id="${h.id}">
-        <div class="thumb" style="background:${CATEGORIES[cat].color}22">${CATEGORIES[cat].icon}</div>
-        <div class="meta"><b>${h.note || CATEGORIES[cat].label}</b>
-          <span>Sev ${h.sev} · ${h.votes} confirms · ${fmtTime(h.createdAt)}</span></div>
-        <span class="badge ${h.status === "verified" ? "ver" : "unv"}">${h.status}</span>
-      </div>`).join("")}
-  `, "Cluster");
-}
-
-/* ============================================================
-   TRACK / MODES  (Bike pulse, Walk health, Patrol cam, Drive)
-   ============================================================ */
-let tracking = { on: false, raf: null, samples: [], lastPulse: 0 };
-
-function renderTrack() {
-  const mode = state.settings.mode;
-  const m = MODE_META[mode];
-  $("#screen-track").innerHTML = `
-    <div class="section-label">Active mode</div>
-    <div class="mode-grid" style="margin-bottom:14px">
-      ${Object.entries(MODE_META).map(([k, mm]) => `
-        <button class="mode-card ${mode === k ? "sel" : ""}" data-act="set-mode" data-mode="${k}" data-stay="track">
-          <span class="emoji">${mm.icon}</span><b>${mm.label}</b><span>${modeBlurb(k)}</span></button>`).join("")}
-    </div>
-    <div id="modePanel"></div>
-    ${tripsHtml()}
-  `;
-  renderModePanel();
-}
-
-function renderModePanel() {
-  const panel = $("#modePanel");
-  if (!panel) return;
-  const mode = state.settings.mode;
-  if (mode === "bike") panel.innerHTML = bikePanel();
-  else if (mode === "walk") panel.innerHTML = walkPanel();
-  else if (mode === "patrol") panel.innerHTML = patrolPanel();
-  else panel.innerHTML = drivePanel();
-
-  if (mode === "bike" && tracking.on) drawMeter();
-}
-
-function bikePanel() {
-  return `
-    <div class="card">
-      <h3>🚲 Bike Pulse Engine</h3>
-      <p class="sub">Mount your phone on the handlebars. PulsePath watches the accelerometer for sudden vertical & lateral impacts (potholes, ruts) and auto-tags GPS.</p>
-      <div class="meter mt" id="meter"></div>
-      <div class="flex" style="justify-content:space-between;margin-top:10px">
-        <div><div class="big-reading" id="reading">0.0</div><span class="muted" style="font-size:11px">live g-force</span></div>
-        <div class="center"><div style="font-weight:800;font-size:18px;color:var(--accent)">${state.settings.threshold.toFixed(1)}</div><span class="muted" style="font-size:11px">trip threshold</span></div>
-      </div>
-      <div class="btn-row mt">
-        <button class="btn ${tracking.on ? "danger" : ""}" data-act="toggle-track">${tracking.on ? "⏹ Stop tracking" : "▶ Start tracking"}</button>
-        <button class="btn ghost" data-act="sim-pulse">⚡ Simulate hit</button>
-      </div>
-      <button class="btn ghost mt" data-act="calibrate">🎚️ ${state.settings.calibrated ? "Re-run" : "Run"} calibration wizard</button>
-      <p class="muted center" style="font-size:11px;margin-top:8px">${Sensors.motionSupported ? "Motion sensor detected ✓" : "No motion sensor — use Simulate hit"}</p>
-    </div>
-    ${terrainCard()}`;
-}
-function terrainCard() {
-  return `<div class="card">
-      <h3>🏔️ Continuous Terrain Calibration</h3>
-      <p class="sub">A filtering loop separates smooth, sustained elevation change (long downhill) from short impact spikes — so a steep West Marin descent doesn't corrupt the map.</p>
-      <div class="kpi-bar mt"><i style="width:72%;background:var(--brand)"></i><i style="width:14%;background:var(--accent)"></i></div>
-      <div class="flex" style="justify-content:space-between;margin-top:6px;font-size:11px" class="muted">
-        <span class="muted">🟢 Smooth terrain 72%</span><span class="muted">🟠 Impact spikes 14%</span></div>
-    </div>`;
-}
-
-function walkPanel() {
-  const connected = state._healthConnected;
-  return `
-    <div class="card">
-      <h3>🚶 Walk Mode</h3>
-      <p class="sub">Instead of an error-prone custom step sensor, Walk Mode pulls clean stats from the native health framework (Apple HealthKit / Google Fit).</p>
-      ${connected ? `
-        <div class="grid-3 mt">
-          <div class="mini"><b>6,418</b><span>steps today</span></div>
-          <div class="mini"><b>2.9 mi</b><span>distance</span></div>
-          <div class="mini"><b>312</b><span>kcal</span></div>
+        <div class="map-ui tr">
+          <button class="map-btn" data-act="map-locate" title="My location">🎯</button>
+          <button class="map-btn" data-act="map-zones" title="Toggle risk zones">▦</button>
+          <button class="map-btn" data-act="map-offline" title="Offline tiles" id="offlineBtn">📶</button>
         </div>
-        <p class="muted center" style="font-size:11px;margin-top:10px">Synced from HealthKit · 2m ago</p>` : `
-        <button class="btn mt" data-act="connect-health"> Connect Apple Health / Google Fit</button>
-        <p class="muted center" style="font-size:11px;margin-top:8px">Native bridge — demo connect on web</p>`}
-    </div>
-    <div class="card">
-      <h3>🔊 Audio Hazard Readouts</h3>
-      <p class="sub">Hands-free TTS announces upcoming dangers into your headphones as you walk.</p>
-      <button class="btn ghost mt" data-act="demo-tts">▶ Preview a readout</button>
-    </div>`;
-}
-
-function patrolPanel() {
-  return `
-    <div class="card">
-      <h3>📷 Visual Patrol Mode</h3>
-      <p class="sub">Arm-mount or dash-mount your phone. The camera watches for structural anomalies & road blocks and pings you to document them.</p>
-      <div class="photo-drop mt" id="patrolView"><span class="e">📹</span><span>Camera preview appears here</span></div>
-      <div class="btn-row mt">
-        <button class="btn" data-act="start-patrol">▶ Start camera watch</button>
-        <button class="btn ghost" data-act="stop-patrol">⏹ Stop</button>
-      </div>
-      <button class="btn ghost mt" data-act="sim-anomaly">🔍 Simulate anomaly detection</button>
-    </div>
-    <div class="card">
-      <h3>🪄 Trail AR Discovery</h3>
-      <p class="sub">Hold up the camera on a trail to see floating markers where community members safely cleared a past obstacle.</p>
-      <button class="btn ghost mt" data-act="start-patrol">Open AR layer</button>
-    </div>`;
-}
-
-function drivePanel() {
-  return `
-    <div class="card">
-      <h3>🚗 Passive Speed Interceptor</h3>
-      <p class="sub">Running quietly in the background, PulsePath notices vehicle-speed travel and sends a friendly next-morning nudge showing the CO₂ you'd save biking that distance.</p>
-      <button class="btn mt" data-act="sim-drive">🚙 Simulate a 6-mile drive</button>
-    </div>
-    <div class="card">
-      <h3>🔋 Battery Optimization Saver</h3>
-      <p class="sub">Below 20% on a remote trail, GPS sampling scales back and camera scanning pauses automatically.</p>
-      <div class="row" style="padding-top:4px"><div class="label"><b>Battery saver</b><span>Auto-throttle under 20%</span></div>
-        <span class="spacer"></span>
-        <label class="switch"><input type="checkbox" data-toggle="battery" ${state.settings.battery ? "checked" : ""}><span class="track"></span></label></div>
-    </div>`;
-}
-
-/* --- Pulse meter rendering --- */
-function drawMeter() {
-  const meter = $("#meter");
-  if (!meter) return;
-  meter.innerHTML = "";
-  const bars = 40;
-  for (let i = 0; i < bars; i++) {
-    const b = document.createElement("div");
-    b.className = "bar";
-    b.style.height = "2px";
-    meter.appendChild(b);
+        <div class="map-ui bl" id="filterChips"></div>
+      </div>`;
   }
-  const line = document.createElement("div");
-  line.className = "threshold-line";
-  const pct = clamp((state.settings.threshold - 8) / 8, 0, 1);
-  line.style.bottom = (8 + pct * 92) + "%";
-  meter.appendChild(line);
-}
-function pushMeter(mag) {
-  const meter = $("#meter");
-  const reading = $("#reading");
-  if (reading) reading.textContent = mag.toFixed(1);
-  if (!meter) return;
-  const bars = $$(".bar", meter);
-  if (!bars.length) return;
-  // shift left
-  for (let i = 0; i < bars.length - 1; i++) bars[i].style.height = bars[i + 1].style.height;
-  const h = clamp((mag - 6) / 18 * 100, 2, 100);
-  const last = bars[bars.length - 1];
-  last.style.height = h + "%";
-  last.style.background = mag >= state.settings.threshold ? "var(--accent)" : "var(--brand)";
+  MapCtl.init();
+  renderFilterChips();
+  $("#offlineBtn").textContent = MapCtl.isOffline() ? "📴" : "📶";
+  setTimeout(() => MapCtl.map && MapCtl.map.invalidateSize(), 60);
 }
 
-/* --- Tracking control --- */
-async function toggleTrack() {
-  if (tracking.on) { stopTrack(); return; }
-  tracking.on = true; tracking.samples = [];
-  startTrip(state.settings.mode);
-  renderModePanel();
-  toast(`${MODE_META[state.settings.mode].icon} Tracking started — stay safe!`, "good");
-  const ok = await Sensors.startMotion(onMotionSample);
-  if (!ok) {
-    // Desktop fallback: synthesize gentle road noise so the meter lives.
-    tracking.fakeTimer = setInterval(() => {
-      const noise = 9.8 + (Math.random() - 0.5) * 2.4;
-      onMotionSample(noise);
-    }, 90);
-  }
-  // Stream real GPS for the route; if unavailable — or if no fix arrives
-  // quickly (desktop preview, GPS cold-start) — simulate a walk so the
-  // recorder still produces a visible route.
-  tracking.gotFix = false;
-  const gps = Sensors.startWatch((pos) => {
-    tracking.gotFix = true;
-    if (tracking.fakeWalk) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; }
-    onTrackPosition(pos.lat, pos.lng);
-  });
-  if (!gps) startFakeWalk();
-  else tracking.warmup = setTimeout(() => { if (tracking.on && !tracking.gotFix) startFakeWalk(); }, 2500);
+function renderFilterChips() {
+  const el = $("#filterChips");
+  if (!el) return;
+  el.innerHTML = Object.entries(CATEGORIES).map(([k, c]) =>
+    `<button class="chip ${state.filters[k] ? "on" : ""}" data-act="filter" data-cat="${k}">${c.icon} ${c.label}</button>`).join("");
 }
-function stopTrack() {
-  tracking.on = false;
-  Sensors.stopMotion();
+
+/* ================= TRACKING (OLED power mode) ================= */
+const Track = {
+  active: false,
+  startedAt: 0,
+  distanceM: 0,
+  pulses: 0,
+  lastPos: null,
+  _wakeVideo: null, _wakeLock: null, _wakeDraw: null,
+  _zoneId: null,
+  _alerted: new Set(), // proximity alert cooldown per hazard
+
+  /* Wakelock: 1×1 black looping silent video (canvas captureStream —
+     no external asset), plus the native Screen Wake Lock API where
+     available. Keeps mobile browsers from throttling sensor loops. */
+  startWakelock() {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1; canvas.height = 1;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#000"; ctx.fillRect(0, 0, 1, 1);
+      this._wakeDraw = setInterval(() => ctx.fillRect(0, 0, 1, 1), 1000);
+      const stream = canvas.captureStream(1);
+      const v = document.createElement("video");
+      v.className = "wakelock";
+      v.muted = true; v.setAttribute("muted", "");
+      v.playsInline = true; v.setAttribute("playsinline", "");
+      v.loop = true;
+      v.srcObject = stream;
+      $("#device").appendChild(v);
+      v.play().catch(() => {});
+      this._wakeVideo = v;
+    } catch (e) {}
+    if ("wakeLock" in navigator) {
+      navigator.wakeLock.request("screen").then(l => { this._wakeLock = l; }).catch(() => {});
+    }
+  },
+  stopWakelock() {
+    if (this._wakeDraw) { clearInterval(this._wakeDraw); this._wakeDraw = null; }
+    if (this._wakeVideo) { this._wakeVideo.remove(); this._wakeVideo = null; }
+    if (this._wakeLock) { this._wakeLock.release().catch(() => {}); this._wakeLock = null; }
+  },
+};
+
+/* Start Tracking — THE user gesture. iOS motion permission and the
+   AudioContext are initialized here and only here (spec rule). */
+async function startTracking() {
+  if (Track.active) return;
+  if (!state.waiverAccepted) { openWaiverSheet(() => startTracking()); return; }
+
+  toast("🔐 Arming sensors…", "", 1500);
+
+  // 1) Permissions + hardware, inside the gesture:
+  await Sensors.requestMotionPermission();
+  let audioOn = false;
+  if (!state.settings.lowPower) audioOn = await Sensors.initAudio();
+
+  // 2) Power: unmount the map entirely (RAM/GPU), start wakelock.
+  MapCtl.destroy();
+  Track.startWakelock();
+
+  // 3) Engine + GPS.
+  Track.active = true;
+  Track.startedAt = Date.now();
+  Track.distanceM = 0; Track.pulses = 0; Track.lastPos = null;
+  Track._zoneId = null; Track._alerted = new Set();
+
+  const started = Engine.start({ lowPower: state.settings.lowPower });
+  Sensors.startWatch(onTrackPosition);
+
+  currentScreen = "track";
+  $$(".screen").forEach(s => s.classList.toggle("active", s.id === "screen-track"));
+  $$(".tab").forEach(t => t.classList.remove("active"));
+  renderTrackScreen(started, audioOn);
+
+  const fallbacks = [];
+  if (!started.motion) fallbacks.push("IMU unavailable → GPS-altitude fallback");
+  if (!audioOn && !state.settings.lowPower) fallbacks.push("mic unavailable → IMU-only");
+  if (state.settings.lowPower) fallbacks.push("Low Power: sonar off");
+  toast("▶ Tracking started" + (fallbacks.length ? "<br>" + fallbacks.join("<br>") : ""), "good", 3400);
+}
+
+function endTracking() {
+  if (!Track.active) return;
+  Track.active = false;
+  Engine.stop();
   Sensors.stopWatch();
-  if (tracking.warmup) { clearTimeout(tracking.warmup); tracking.warmup = null; }
-  if (tracking.fakeTimer) { clearInterval(tracking.fakeTimer); tracking.fakeTimer = null; }
-  if (tracking.fakeWalk) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; }
-  endTrip();
-  if (currentScreen === "track") renderTrack(); else renderModePanel();
+  Sensors.stopAudio();
+  Track.stopWakelock();
+  hideCancelOverlay(true);
+
+  const mins = Math.max(1, Math.round((Date.now() - Track.startedAt) / 60000));
+  const km = (Track.distanceM / 1000).toFixed(1);
+  pushHistory("🏁", `Tracked ${km} km in ${mins} min — ${Track.pulses} auto-detection${Track.pulses === 1 ? "" : "s"}`);
+  toast(`🏁 Trip saved: ${km} km · ${mins} min · ${Track.pulses} detections`, "good", 3600);
+  showScreen("home");
 }
-function onMotionSample(mag) {
-  pushMeter(mag);
-  // Detect an impact above the trip threshold (debounced).
-  if (mag >= state.settings.threshold && Date.now() - tracking.lastPulse > 1400) {
-    tracking.lastPulse = Date.now();
-    logPulse(mag);
+
+function renderTrackScreen(started, audioOn) {
+  $("#screen-track").innerHTML = `
+    <div class="oled" id="oled">
+      <div>
+        <span class="big" id="tSpeed">0</span>
+        <span class="unit"> mph</span>
+      </div>
+      <div class="armed-line off" id="tArmed">DISARMED — 6–22 MPH WINDOW</div>
+      <div class="zone-line" id="tZone"></div>
+      <div class="tele-grid">
+        <div class="tele"><b id="tDist">0.0</b><span>km</span></div>
+        <div class="tele"><b id="tTime">0:00</b><span>elapsed</span></div>
+        <div class="tele"><b id="tPulses">0</b><span>detections</span></div>
+        <div class="tele"><b id="tDev">—</b><span>iz dev / thr</span></div>
+      </div>
+      <div class="tele-grid" style="margin-top:14px">
+        <div class="tele"><b style="font-size:13px">${started.motion ? "IMU" : "GPS-ALT"}</b><span>Iz source</span></div>
+        <div class="tele"><b style="font-size:13px">${state.settings.lowPower ? "OFF" : (audioOn ? "LIVE" : "N/A")}</b><span>Ab sonar</span></div>
+      </div>
+      <button class="end-btn" data-act="end-track">■ End tracking</button>
+    </div>`;
+  Engine.onTelemetry = (t) => {
+    const s = $("#tSpeed"); if (!s) return;
+    s.textContent = Math.round(t.speedMph);
+    $("#tDist").textContent = (Track.distanceM / 1000).toFixed(1);
+    const el = Math.floor((Date.now() - Track.startedAt) / 1000);
+    $("#tTime").textContent = Math.floor(el / 60) + ":" + String(el % 60).padStart(2, "0");
+    $("#tPulses").textContent = Track.pulses;
+    $("#tDev").textContent = t.dev.toFixed(1) + "/" + t.threshold.toFixed(1);
+    const a = $("#tArmed");
+    a.className = "armed-line " + (t.armed ? "on" : "off");
+    a.textContent = t.armed ? "ARMED — SENSOR FUSION LIVE" : "DISARMED — 6–22 MPH WINDOW";
+    $("#tZone").textContent = t.zone ? `zone: ${t.zone.riskType} · threshold ×${zoneSensorFactor(t.zone)}` : "";
+  };
+}
+
+function onTrackPosition(pos) {
+  Engine.updatePosition(pos);
+  // Distance accumulation (ignore poor fixes).
+  if (pos.acc == null || pos.acc < 60) {
+    if (Track.lastPos) {
+      const d = haversineM(Track.lastPos, pos);
+      if (d > 1 && d < 200) Track.distanceM += d;
+    }
+    Track.lastPos = { lat: pos.lat, lng: pos.lng };
+  }
+  // Zone entry announcements (the hazardlocations.js purpose).
+  const z = zoneForPoint(pos.lat, pos.lng);
+  const zid = z ? z.id : null;
+  if (zid !== Track._zoneId) {
+    Track._zoneId = zid;
+    if (z) {
+      toast(`⚠️ Entering risk corridor: ${esc(z.riskType)}`, "warn", 3600);
+      if (state.settings.tts) Sensors.speak(`Caution. Entering ${z.riskType.split("/")[0].trim()} area.`);
+      Sensors.buzz([60, 40, 60]);
+    }
+  }
+  checkProximity(pos);
+}
+
+/* AirPods-style proximity voice alerts: verified hazards ahead. */
+function checkProximity(pos) {
+  if (!state.settings.tts && !Sensors.vibrateSupported) return;
+  for (const h of allHazards()) {
+    if (h.status !== "verified" || Track._alerted.has(h.id)) continue;
+    if (haversineM(pos, h) <= state.settings.radiusM) {
+      Track._alerted.add(h.id);
+      const c = CATEGORIES[h.cat];
+      if (state.settings.tts) Sensors.speak(`Warning: ${c.label} ahead.`);
+      Feedback.alert([80, 50, 80]);
+      if (Track.active) Track._lastProx = h.id;
+      else toast(`🔊 ${c.icon} ${c.label} nearby`, "warn");
+    }
   }
 }
-function logPulse(mag) {
-  Sensors.buzz([40, 30, 40]);
-  const g = (mag / 9.8).toFixed(1);
-  const item = {
-    id: uid(), type: "pulse", cat: "pothole", sev: clamp(Math.round((mag - 10) / 2) + 2, 1, 5),
-    x: clamp(state.me.x + (Math.random() - 0.5) * 3, 4, 96),
-    y: clamp(state.me.y + (Math.random() - 0.5) * 3, 6, 94),
-    createdAt: Date.now(), note: `Auto-logged impact ${g}g`,
+
+/* ================= Engine event wiring (global, incl. demo) ================= */
+function wireEngine() {
+  Engine.onDetect = (d) => {
+    // Sharp double-vibration + chime, then the 10-second Cancel window.
+    Feedback.alert([120, 80, 120]);
+    Feedback.tone(980, 120); setTimeout(() => Feedback.tone(980, 120), 180);
+    const pos = Track.lastPos || NOVATO_CENTER;
+    const z = zoneForPoint(pos.lat, pos.lng);
+    showCancelOverlay({
+      cat: d.cat, sev: d.sev,
+      lat: pos.lat, lng: pos.lng,
+      zoneId: z ? z.id : null,
+      note: `Auto-detected ${d.scenario.replace(/_/g, " ")} (confidence ${(d.confidence * 100) | 0}%${d.sim ? ", simulated" : ""})`,
+      source: "auto",
+    });
   };
-  Object.assign(item, xyToGeo(item.x, item.y));
-  state.queue.unshift(item);
-  if (trip) trip.pulses++;
+  Engine.onIgnore = (d) => {
+    toast(`↷ Bypassed: ${d.scenario === "cattle_guard" ? "cattle guard / metal grate" : "speed bump"} (not a hazard)`, "", 2200);
+  };
+  Engine.onBeacon = () => showBeacon();
+}
+
+/* ---- 10-second Cancel-Log overlay ---- */
+const CancelCtl = { timer: null, payload: null, count: 10 };
+function showCancelOverlay(payload) {
+  hideCancelOverlay(true);
+  CancelCtl.payload = payload;
+  CancelCtl.count = 10;
+  $("#cancelWhat").textContent = `${CATEGORIES[payload.cat].icon} ${CATEGORIES[payload.cat].label} detected — logging in`;
+  $("#cancelCount").textContent = "10";
+  $("#cancelOverlay").classList.add("show");
+  CancelCtl.timer = setInterval(() => {
+    CancelCtl.count--;
+    const el = $("#cancelCount");
+    if (el) el.textContent = CancelCtl.count;
+    if (CancelCtl.count <= 0) commitCancelOverlay();
+  }, 1000);
+}
+async function commitCancelOverlay() {
+  const p = CancelCtl.payload;
+  hideCancelOverlay(false);
+  if (!p) return;
+  Track.pulses++;
+  await Sync.enqueue(p, "auto");
+  pushHistory("📡", `Auto-logged ${CATEGORIES[p.cat].label} (encrypted to inbox)`);
+  toast(`🔐 ${CATEGORIES[p.cat].label} encrypted → Review inbox`, "good");
+  updateInboxBadge();
+}
+function hideCancelOverlay(discard) {
+  if (CancelCtl.timer) { clearInterval(CancelCtl.timer); CancelCtl.timer = null; }
+  $("#cancelOverlay").classList.remove("show");
+  if (discard) CancelCtl.payload = null;
+}
+
+/* ---- Safety Beacon ---- */
+const Beacon = { toneTimer: null };
+function showBeacon() {
+  $("#beacon").classList.add("show");
+  const burst = () => { Feedback.tone(1400, 350, 0.9); Sensors.buzz([300, 120, 300]); };
+  burst();
+  Beacon.toneTimer = setInterval(burst, 900);
+}
+function hideBeacon() {
+  $("#beacon").classList.remove("show");
+  if (Beacon.toneTimer) { clearInterval(Beacon.toneTimer); Beacon.toneTimer = null; }
+  pushHistory("🛟", "Safety Beacon dismissed — marked OK");
+}
+
+/* ================= CAPTURE (FAB) ================= */
+const Capture = { photo: null, cat: "pothole", sev: 3, pos: null, dictating: false };
+async function openCapture(preset) {
+  Capture.photo = null;
+  Capture.cat = preset?.cat || "pothole";
+  Capture.sev = 3;
+  Capture.pos = preset?.lat ? { lat: preset.lat, lng: preset.lng } : null;
+
+  openSheet(`
+    <h2>＋ Capture hazard</h2>
+    <p class="sub">Photo + GPS pin, encrypted on-device. <span class="lock-tag">🔒 AES-256-GCM</span></p>
+    <div class="row" style="margin-bottom:10px">
+      <video id="capCam" style="width:104px;height:78px;border-radius:10px;background:#111;object-fit:cover" playsinline muted></video>
+      <div style="flex:1;display:flex;flex-direction:column;gap:7px">
+        <button class="btn ghost sm" data-act="cap-snap">📷 Snap photo</button>
+        <label class="btn ghost sm" style="text-align:center">🖼️ Choose file<input type="file" accept="image/*" capture="environment" id="capFile" style="display:none"></label>
+      </div>
+    </div>
+    <div id="capThumbWrap" style="display:none;margin-bottom:10px"><img id="capThumb" style="width:100%;border-radius:10px;max-height:140px;object-fit:cover"></div>
+    <div class="cat-picker" id="capCats"></div>
+    <p class="muted mt" style="margin-bottom:4px">Severity</p>
+    <div class="sev-picker" id="capSev"></div>
+    <p class="muted mt" style="margin-bottom:4px">Note — typed or dictated (raw transcript only, never AI-written)</p>
+    <div class="row">
+      <textarea id="capNote" rows="2" placeholder="e.g. deep pothole, right lane"></textarea>
+      <button class="icon-btn" data-act="cap-dictate" id="capMic" title="Dictate">🎙️</button>
+    </div>
+    <p class="muted mt" id="capGPS">📡 Acquiring GPS…</p>
+    <button class="btn accent mt" data-act="cap-save">🔐 Encrypt &amp; queue report</button>
+  `, () => { Sensors.stopCamera(); Sensors.stopDictation(); });
+
+  renderCapPickers();
+  const fi = $("#capFile");
+  if (fi) fi.addEventListener("change", () => readCaptureFile(fi));
+  Sensors.startCamera($("#capCam"));
+  if (!Capture.pos) {
+    const pos = await Sensors.getPosition();
+    Capture.pos = pos || { ...NOVATO_CENTER, approx: true };
+  }
+  const g = $("#capGPS");
+  if (g) {
+    const z = zoneForPoint(Capture.pos.lat, Capture.pos.lng);
+    g.innerHTML = `📡 ${Capture.pos.lat.toFixed(5)}, ${Capture.pos.lng.toFixed(5)}${Capture.pos.approx ? " (approx — GPS unavailable)" : ""}${z ? `<br>⚠️ Inside: ${esc(z.riskType)} corridor` : ""}`;
+  }
+}
+function renderCapPickers() {
+  $("#capCats").innerHTML = Object.entries(CATEGORIES).map(([k, c]) =>
+    `<button class="${Capture.cat === k ? "on" : ""}" data-act="cap-cat" data-cat="${k}"><span class="ic">${c.icon}</span>${c.label}</button>`).join("");
+  $("#capSev").innerHTML = [1, 2, 3, 4, 5].map(n =>
+    `<button class="${Capture.sev === n ? "on" : ""}" data-act="cap-sev" data-sev="${n}" style="${Capture.sev === n ? `background:${sevColor(n)}` : ""}">${n}</button>`).join("");
+}
+function snapCapturePhoto() {
+  const v = $("#capCam");
+  if (!v || !v.videoWidth) { toast("Camera unavailable — use Choose file", "warn"); return; }
+  const c = document.createElement("canvas");
+  const scale = Math.min(1, 720 / v.videoWidth);
+  c.width = v.videoWidth * scale; c.height = v.videoHeight * scale;
+  c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+  Capture.photo = c.toDataURL("image/jpeg", 0.72);
+  showCaptureThumb();
+}
+function readCaptureFile(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      const scale = Math.min(1, 720 / img.width);
+      c.width = img.width * scale; c.height = img.height * scale;
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      Capture.photo = c.toDataURL("image/jpeg", 0.72);
+      showCaptureThumb();
+    };
+    img.src = rd.result;
+  };
+  rd.readAsDataURL(f);
+}
+function showCaptureThumb() {
+  $("#capThumbWrap").style.display = "block";
+  $("#capThumb").src = Capture.photo;
+  toast("📷 Photo attached", "good", 1600);
+}
+function toggleDictation() {
+  const mic = $("#capMic");
+  if (Capture.dictating) { Sensors.stopDictation(); Capture.dictating = false; mic.style.background = ""; return; }
+  const ok = Sensors.startDictation(
+    (text) => { const n = $("#capNote"); if (n) n.value = text; },
+    () => { Capture.dictating = false; const m = $("#capMic"); if (m) m.style.background = ""; });
+  if (!ok) { toast("Dictation not supported on this browser", "warn"); return; }
+  Capture.dictating = true;
+  mic.style.background = "var(--accent-soft)";
+  toast("🎙️ Listening — speak your note", "", 2000);
+}
+async function saveCapture() {
+  if (!state.ageConfirmed) { closeSheet(); openAgeSheet(() => openCapture()); return; }
+  const pos = Capture.pos || NOVATO_CENTER;
+  const z = zoneForPoint(pos.lat, pos.lng);
+  const payload = {
+    cat: Capture.cat, sev: Capture.sev,
+    lat: +pos.lat.toFixed(6), lng: +pos.lng.toFixed(6),
+    note: ($("#capNote")?.value || "").slice(0, 400),
+    photo: Capture.photo, hasPhoto: !!Capture.photo,
+    zoneId: z ? z.id : null,
+    source: "manual", capturedAt: Date.now(),
+  };
+  closeSheet();
+  await Sync.enqueue(payload, "manual");
+  state.profile.points += 1;
+  pushHistory("📷", `Captured ${CATEGORIES[payload.cat].label} (encrypted to inbox)`);
   save();
   updateInboxBadge();
-  toast(`⚡ Impact logged (${g}g) → review queue`, "alert");
-  if (state.settings.tts) Sensors.speak("Hazard logged");
+  toast(`🔐 Encrypted &amp; queued — ${state.settings.autoUpload ? "auto-uploads within 10 min" : "approve it in Review"}`, "good", 3400);
 }
 
-/* ============================================================
-   ROUTE TRIP RECORDER
-   Records the active ride/walk as a live polyline, saves it as a
-   trip with stats, and powers the "Recent trips" history.
-   ============================================================ */
-let trip = null, routeLine = null, savedRouteLine = null;
-
-function startTrip(mode) {
-  trip = { id: uid(), mode, startedAt: Date.now(), endedAt: null, distance: 0, durationSec: 0, pulses: 0, points: [] };
-  if (routeLine && lmap) lmap.removeLayer(routeLine);
-  routeLine = null;
+/* Manual report from a map tap. */
+function openManualReport(latlng) {
+  openCapture({ lat: latlng.lat, lng: latlng.lng });
 }
 
-function recordPoint(lat, lng) {
-  if (!trip) return;
-  const pts = trip.points;
-  if (pts.length && typeof L !== "undefined") {
-    const prev = pts[pts.length - 1];
-    trip.distance += L.latLng(prev[0], prev[1]).distanceTo([lat, lng]);
-  }
-  pts.push([lat, lng]);
-  drawActiveRoute();
-}
-
-function drawActiveRoute() {
-  if (!lmap || !trip || !trip.points.length) return;
-  if (!routeLine) routeLine = L.polyline(trip.points, { color: "#ff8a3d", weight: 4, lineCap: "round", opacity: .9 }).addTo(lmap);
-  else routeLine.setLatLngs(trip.points);
-}
-
-function onTrackPosition(lat, lng) {
-  state.me = geoToXY(lat, lng);
-  recordPoint(lat, lng);
-  if (lmap && currentScreen === "map") updateMeLayer();
-  checkProximity();
-}
-
-// Desktop preview: no GPS, so wander along a gentle path to draw a route.
-function startFakeWalk() {
-  const path = [{ x: state.me.x, y: state.me.y }, { x: 38, y: 40 }, { x: 48, y: 50 }, { x: 60, y: 60 }, { x: 70, y: 56 }];
-  let i = 0, step = 0;
-  tracking.fakeWalk = setInterval(() => {
-    const a = path[i], b = path[i + 1];
-    if (!b) { clearInterval(tracking.fakeWalk); tracking.fakeWalk = null; return; }
-    step += 0.1;
-    const x = a.x + (b.x - a.x) * step, y = a.y + (b.y - a.y) * step;
-    if (step >= 1) { step = 0; i++; }
-    const g = xyToGeo(clamp(x, 3, 97), clamp(y, 3, 97));
-    onTrackPosition(g.lat, g.lng);
-  }, 700);
-}
-
-function endTrip() {
-  const t = trip; trip = null;
-  if (routeLine && lmap) { lmap.removeLayer(routeLine); routeLine = null; }
-  if (!t || t.points.length < 2) { toast("⏹ Tracking stopped"); return; }
-  t.endedAt = Date.now();
-  t.durationSec = Math.max(1, Math.round((t.endedAt - t.startedAt) / 1000));
-  state.trips.unshift(t);
-  state.profile.miles = +(state.profile.miles + t.distance / 1609.34).toFixed(1);
-  save();
-  showTripSummary(t);
-  mascot("Route saved! 🦦");
-}
-
-/* --- formatting + sparkline --- */
-function fmtDist(m) { return m < 950 ? Math.round(m) + " m" : (m / 1000).toFixed(1) + " km"; }
-function fmtDur(s) { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60; return h ? `${h}h ${m}m` : `${m}m ${ss}s`; }
-function tripSpeed(t) { const kmh = (t.distance / 1000) / (t.durationSec / 3600); return isFinite(kmh) && kmh > 0 ? kmh.toFixed(1) + " km/h" : "—"; }
-
-function routeSparkline(points, w = 64, h = 36, color = "var(--brand)") {
-  if (!points || points.length < 2) return `<div class="route-spark empty">—</div>`;
-  const lats = points.map(p => p[0]), lngs = points.map(p => p[1]);
-  const minLa = Math.min(...lats), maxLa = Math.max(...lats), minLo = Math.min(...lngs), maxLo = Math.max(...lngs);
-  const spanLa = (maxLa - minLa) || 1e-6, spanLo = (maxLo - minLo) || 1e-6, pad = 4;
-  const pts = points.map(([la, lo]) => {
-    const x = pad + ((lo - minLo) / spanLo) * (w - 2 * pad);
-    const y = pad + ((maxLa - la) / spanLa) * (h - 2 * pad);
-    return x.toFixed(1) + "," + y.toFixed(1);
-  }).join(" ");
-  return `<svg class="route-spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" preserveAspectRatio="none">
-    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-}
-
-function showTripSummary(t) {
-  openSheet(`
-    <h2>${MODE_META[t.mode].icon} Trip recorded</h2>
-    <p class="sub">Nice ${t.mode}! Here's how it went.</p>
-    <div class="center" style="margin:10px 0">${routeSparkline(t.points, 240, 96, "var(--accent)")}</div>
-    <div class="grid-3">
-      <div class="mini"><b>${fmtDist(t.distance)}</b><span>distance</span></div>
-      <div class="mini"><b>${fmtDur(t.durationSec)}</b><span>duration</span></div>
-      <div class="mini"><b>${t.pulses}</b><span>pulses</span></div>
-    </div>
-    <div class="mini mt"><b style="font-size:13px">${tripSpeed(t)}</b><span>average speed</span></div>
-    <button class="btn accent mt" data-act="view-trip" data-id="${t.id}">🗺️ View route on map</button>
-    <button class="btn ghost mt" data-act="close-sheet">Done</button>
-  `, "Trip");
-}
-
-function viewTrip(id) {
-  const t = state.trips.find(x => x.id === id);
-  if (!t) return;
-  closeSheet();
-  showScreen("map");
-  setTimeout(() => {
-    if (!lmap) return;
-    if (savedRouteLine) { lmap.removeLayer(savedRouteLine); savedRouteLine = null; }
-    savedRouteLine = L.polyline(t.points, { color: "#1f9d8f", weight: 4, lineCap: "round", opacity: .95 }).addTo(lmap);
-    lmap.fitBounds(savedRouteLine.getBounds().pad(0.3));
-  }, 150);
-  toast(`${MODE_META[t.mode].icon} ${fmtDist(t.distance)} route`);
-}
-
-function deleteTrip(id) {
-  state.trips = state.trips.filter(x => x.id !== id);
-  save();
-  if (currentScreen === "track") renderTrack();
-  toast("🗑️ Trip deleted");
-}
-
-function tripsHtml() {
-  if (!state.trips.length) return "";
-  return `<div class="section-label" style="margin-top:8px">Recent trips · ${state.trips.length}</div>` +
-    state.trips.slice(0, 8).map(t => `
-      <div class="trip-card">
-        <div class="trip-spark">${routeSparkline(t.points)}</div>
-        <div class="meta">
-          <b>${MODE_META[t.mode].icon} ${fmtDist(t.distance)} · ${fmtDur(t.durationSec)}</b>
-          <span>${t.pulses} pulse${t.pulses === 1 ? "" : "s"} logged · ${fmtTime(t.startedAt)}</span>
-        </div>
-        <div class="acts">
-          <button class="round ok" data-act="view-trip" data-id="${t.id}" title="View on map">🗺️</button>
-          <button class="round no" data-act="delete-trip" data-id="${t.id}" title="Delete">✕</button>
-        </div>
-      </div>`).join("");
-}
-
-/* ============================================================
-   CAPTURE SHEET  (One-tap quick capture)
-   ============================================================ */
-let draft = null;
-function openCapture(presetXY) {
-  draft = {
-    cat: "pothole", sev: 3, photo: null,
-    x: presetXY ? presetXY.x : state.me.x,
-    y: presetXY ? presetXY.y : state.me.y,
-    note: "",
-  };
-  renderCapture();
-  openSheet(null, "Quick Capture", "capture");
-}
-function renderCapture() {
-  const geo = xyToGeo(draft.x, draft.y);
-  setSheet(`
-    <h2>📸 Quick Capture</h2>
-    <p class="sub">Snap a hazard — GPS is auto-tagged and it lands in your review queue.</p>
-
-    <div class="photo-drop" data-act="pick-photo">
-      ${draft.photo ? `<img src="${draft.photo}">` : `<span class="e">📷</span><span>Tap to take / choose photo</span>`}
-    </div>
-    <input type="file" id="photoInput" accept="image/*" capture="environment" hidden>
-
-    <div class="section-label" style="margin-top:14px">Category</div>
-    <div class="cat-pick">
-      ${Object.entries(CATEGORIES).map(([k, c]) => `
-        <button class="cat-opt ${draft.cat === k ? "sel" : ""}" data-act="draft-cat" data-cat="${k}">
-          <span class="e">${c.icon}</span><small>${c.label}</small></button>`).join("")}
-    </div>
-
-    <div class="section-label">Severity</div>
-    <div class="sev-pick">
-      ${[1, 2, 3, 4, 5].map(n => `
-        <button class="sev-opt ${draft.sev === n ? "sel" : ""}" data-act="draft-sev" data-sev="${n}"
-          style="${draft.sev === n ? `background:${sevColor(n)}` : ""}">${n}</button>`).join("")}
-    </div>
-    <p class="muted center" style="font-size:11px">${sevLabel(draft.sev)}</p>
-
-    <div class="mini" style="margin-top:12px"><b style="font-size:13px">📍 ${geo.lat}, ${geo.lng}</b><span>Auto-GPS tagged · ${Sensors.geoSupported ? "live GPS available" : "demo coords"}</span></div>
-
-    <button class="btn accent mt" data-act="save-capture">Save to review queue</button>
-  `);
-}
-
-/* ============================================================
-   INBOX  (Local verification review log)
-   ============================================================ */
-function updateInboxBadge() {
-  const n = state.queue.length;
+/* ================= INBOX / REVIEW ================= */
+async function updateInboxBadge() {
+  const n = await VaultDB.count();
   const b = $("#inboxBadge");
   b.style.display = n ? "grid" : "none";
   b.textContent = n;
 }
-function renderInbox() {
-  if (!state.queue.length) {
-    $("#screen-inbox").innerHTML = `
-      <div class="section-label">Review log</div>
-      <div class="empty"><span class="e">📭</span>All caught up! Auto-logged pulses & widget photos show up here for you to confirm before they post.</div>`;
-    return;
-  }
-  $("#screen-inbox").innerHTML = `
-    <div class="section-label">End-of-day review · ${state.queue.length} pending</div>
-    <p class="muted" style="font-size:12px;margin:0 4px 12px">Confirm to post publicly, or delete. Nothing goes to the community map until you approve it.</p>
-    ${state.queue.map(q => {
-      const c = CATEGORIES[q.cat];
-      return `<div class="inbox-item">
-        <div class="thumb" style="background:${c.color}22">${q.photo ? `<img src="${q.photo}">` : c.icon}</div>
+async function renderInbox() {
+  const rows = await Sync.pending();
+  const status = Sync.configured
+    ? (navigator.onLine ? `☁️ Supabase connected · ${state.settings.autoUpload ? "auto-upload every 10 min" : "manual approval mode"}${Sync.lastSyncAt ? ` · last sync ${fmtAgo(Sync.lastSyncAt)}` : ""}` : "📴 Offline — uploads resume on reconnect")
+    : "⚠️ Sync unavailable — reports stay encrypted on-device";
+  const scr = $("#screen-inbox");
+  scr.innerHTML = `
+    <h1>Review</h1>
+    <p class="sub">${rows.length ? `${rows.length} encrypted report${rows.length === 1 ? "" : "s"} staged locally.` : "Nothing staged — you're all caught up."}<br>${status}</p>
+    ${rows.length ? `<div class="row" style="margin-bottom:12px">
+      <button class="btn sm" data-act="inbox-approve-all">☁️ Approve &amp; upload all</button>
+      ${state.settings.autoUpload && Sync.configured ? `<button class="btn ghost sm" data-act="inbox-sync-now">Sync now</button>` : ""}
+    </div>` : ""}
+    <div id="inboxList">${rows.map(r => `
+      <div class="inbox-item" id="ib-${r.id}">
+        <div class="ico">🔒</div>
         <div class="meta">
-          <b>${c.label} · Sev ${q.sev}</b>
-          <span>${q.type === "pulse" ? "⚡" : "📷"} ${q.note} · ${fmtTime(q.createdAt)}</span>
+          <b>Decrypting…</b>
+          <span>${r.source === "auto" ? "sensor auto-detection" : "manual capture"} · ${fmtAgo(r.createdAt)} · <span class="lock-tag">AES-256-GCM</span></span>
         </div>
         <div class="acts">
-          <button class="round ok" data-act="approve-q" data-id="${q.id}">✓</button>
-          <button class="round no" data-act="reject-q" data-id="${q.id}">✕</button>
+          <button data-act="inbox-approve" data-id="${r.id}" title="Approve & upload">☁️</button>
+          <button data-act="inbox-discard" data-id="${r.id}" title="Discard">🗑️</button>
         </div>
-      </div>`;
-    }).join("")}
-    <button class="btn ghost mt" data-act="approve-all">✅ Confirm all & post</button>
-  `;
+      </div>`).join("")}
+    </div>`;
+  // Decrypt for display (device key stays local; storage stays encrypted).
+  for (const r of rows) {
+    const p = await Sync.reveal(r);
+    const el = $(`#ib-${r.id} .meta b`);
+    if (el && p) {
+      const c = CATEGORIES[p.cat] || { icon: "⚠️", label: p.cat };
+      el.innerHTML = `${c.icon} ${c.label} · sev ${p.sev} <span style="color:${sevColor(p.sev)}">●</span>`;
+      const ico = $(`#ib-${r.id} .ico`);
+      if (ico) {
+        if (p.photo) { ico.innerHTML = `<img src="${p.photo}" style="width:40px;height:40px;border-radius:10px;object-fit:cover">`; }
+        else ico.textContent = c.icon;
+      }
+      const span = $(`#ib-${r.id} .meta span`);
+      if (span && p.note) span.innerHTML += `<br>“${esc(p.note.slice(0, 70))}”`;
+    } else if (el) el.textContent = "⚠️ Unreadable record";
+  }
+}
+async function approveInboxItem(id) {
+  const rows = await Sync.pending();
+  const row = rows.find(r => r.id === id);
+  if (!row) return;
+  const res = await Sync.uploadOne(row);
+  if (res.ok) {
+    adoptUploaded(res.payload);
+    toast("☁️ Uploaded to the community map", "good");
+  } else if (res.reason === "offline") {
+    toast("📴 Offline or sync unavailable — kept encrypted locally", "warn");
+  } else if (res.reason === "corrupt") {
+    toast("Removed unreadable record", "warn");
+  } else {
+    toast("Upload failed: " + esc(res.reason), "bad");
+  }
+  renderInbox(); updateInboxBadge();
+}
+function adoptUploaded(p) {
+  state.hazards.push({
+    id: uid(), cat: p.cat, lat: p.lat, lng: p.lng, sev: p.sev,
+    status: "unverified", votes: 1, note: p.note || "", mine: true, createdAt: Date.now(),
+  });
+  state.profile.mapped += 1;
+  state.profile.points += 2;
+  pushHistory("☁️", `Published ${CATEGORIES[p.cat].label} to the community map`);
+  save();
+  MapCtl.refreshPins();
+}
+async function approveAllInbox() {
+  const results = await Sync.flush();
+  const ok = results.filter(r => r.ok);
+  ok.forEach(r => adoptUploaded(r.payload));
+  if (ok.length) toast(`☁️ Uploaded ${ok.length} report${ok.length === 1 ? "" : "s"}`, "good");
+  const failed = results.length - ok.length;
+  if (failed) toast(`📴 ${failed} kept locally (offline or error)`, "warn");
+  renderInbox(); updateInboxBadge();
 }
 
-/* ============================================================
-   PROFILE  (Impact dashboard + medals + history)
-   ============================================================ */
-function unlockedMedals() { return MEDALS.filter(m => m.test(state)); }
-function renderProfile() {
-  const p = state.profile;
-  const medals = MEDALS;
-  const recent = state.hazards.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 4);
-  $("#screen-profile").innerHTML = `
-    <div class="card center">
-      <div class="avatar" data-act="pick-avatar">${p.photo ? `<img src="${p.photo}">` : "🦦"}</div>
-      <h3 style="font-size:18px" data-act="rename">${p.name} ✏️</h3>
-      <p class="sub">Level ${1 + Math.floor((p.mapped + p.verified) / 10)} contributor · joined this season</p>
-      <input type="file" id="avatarInput" accept="image/*" hidden>
-    </div>
-
-    <div class="section-label">Your impact</div>
-    <div class="grid-2">
-      <div class="mini"><b>${p.mapped}</b><span>hazards mapped</span></div>
-      <div class="mini"><b>${p.verified}</b><span>reports verified</span></div>
-      <div class="mini"><b>${p.carbon.toFixed(1)} kg</b><span>CO₂ offset</span></div>
-      <div class="mini"><b>${p.miles} mi</b><span>routes tracked</span></div>
-      <div class="mini"><b>${state.trips.length}</b><span>trips recorded</span></div>
-      <div class="mini"><b>${fmtDist(state.trips.reduce((s, t) => s + (t.distance || 0), 0))}</b><span>total distance</span></div>
-    </div>
-
-    <div class="section-label" style="margin-top:16px">Medals · ${unlockedMedals().length}/${medals.length}</div>
-    <div class="medal-grid">
-      ${medals.map(m => {
-        const on = m.test(state);
-        return `<div class="medal ${on ? "" : "locked"}"><div class="m">${m.icon}</div><b>${m.name}</b><span>${m.desc}</span></div>`;
-      }).join("")}
-    </div>
-
-    <div class="section-label" style="margin-top:16px">Recent reports</div>
-    ${recent.map(h => `<div class="inbox-item">
-      <div class="thumb" style="background:${CATEGORIES[h.cat].color}22">${CATEGORIES[h.cat].icon}</div>
-      <div class="meta"><b>${CATEGORIES[h.cat].label}</b><span>${h.note || ""} · ${fmtTime(h.createdAt)}</span></div>
-      <span class="badge ${h.status === "verified" ? "ver" : "unv"}">${h.status}</span></div>`).join("")}
-
-    <button class="btn ghost mt" data-act="go-settings">⚙️ Settings & export</button>
-    <button class="btn ghost mt" data-act="show-guide">📖 Replay intro guide</button>
-  `;
-}
-
-/* ============================================================
-   SETTINGS  (Radius, dark, voice, export, reset)
-   ============================================================ */
-function renderSettings() {
-  const s = state.settings;
-  $("#screen-settings").innerHTML = `
-    <div class="section-label">Appearance & safety</div>
-    <div class="card">
-      <div class="row" style="padding-top:2px"><div class="label"><b>🌙 True dark mode</b><span>Low-glare for dawn / night rides</span></div>
-        <span class="spacer"></span><label class="switch"><input type="checkbox" data-toggle="dark" ${s.dark ? "checked" : ""}><span class="track"></span></label></div>
-      <div class="row"><div class="label"><b>🔊 Audio hazard readouts</b><span>Speak alerts aloud (TTS)</span></div>
-        <span class="spacer"></span><label class="switch"><input type="checkbox" data-toggle="tts" ${s.tts ? "checked" : ""}><span class="track"></span></label></div>
-      <div class="row"><div class="label"><b>🔋 Battery saver</b><span>Throttle GPS/camera under 20%</span></div>
-        <span class="spacer"></span><label class="switch"><input type="checkbox" data-toggle="battery" ${s.battery ? "checked" : ""}><span class="track"></span></label></div>
-    </div>
-
-    <div class="section-label">Proximity alerts</div>
-    <div class="card">
-      <div class="flex" style="justify-content:space-between"><b>Warn me within</b><b style="color:var(--brand)" id="radiusVal">${s.radius} m</b></div>
-      <input type="range" min="10" max="100" step="5" value="${s.radius}" data-range="radius" class="mt">
-      <p class="sub mt">Closer to a logged hazard than this and you'll get a haptic + audio heads-up.</p>
-    </div>
-
-    <div class="section-label">Pulse sensitivity</div>
-    <div class="card">
-      <div class="flex" style="justify-content:space-between"><b>Impact threshold</b><b style="color:var(--accent)" id="threshVal">${s.threshold.toFixed(1)} g</b></div>
-      <input type="range" min="10.5" max="18" step="0.1" value="${s.threshold}" data-range="threshold" class="mt">
-      <button class="btn ghost mt" data-act="calibrate">🎚️ Run calibration wizard</button>
-    </div>
-
-    <div class="section-label">Data export portal</div>
-    <div class="card">
-      <p class="sub">Anonymized infrastructure data for schools, science classes & planning groups.</p>
-      <div class="btn-row mt">
-        <button class="btn ghost" data-act="export-csv">⬇️ CSV</button>
-        <button class="btn ghost" data-act="export-geojson">⬇️ GeoJSON</button>
-      </div>
-    </div>
-
-    <div class="section-label">About</div>
-    <div class="card">
-      <p class="sub">PulsePath keeps your tracking on-device until you confirm a report. Auto-logs stay private in your review queue. Coordinates posted publicly are rounded for safety.</p>
-      <button class="btn ghost mt" data-act="reset-app">♻️ Reset demo data</button>
-    </div>
-  `;
-}
-
-/* ============================================================
-   Email drafter, clearing guide, calibration, export, etc.
-   ============================================================ */
-function draftEmail(id) {
-  const h = state.hazards.find(x => x.id === id);
+/* ================= PIN SHEET / CIVIC ACTIONS ================= */
+function openPin(id) {
+  const h = allHazards().find(x => x.id === id);
   if (!h) return;
   const c = CATEGORIES[h.cat];
-  const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-  const body =
-`Hello Marin Public Works / FixItMarin team,
-
-I'd like to report a ${c.label.toLowerCase()} that's creating a safety hazard for local commuters, hikers and cyclists.
-
-  • Type: ${c.label}
-  • Severity: ${h.sev}/5 (${sevLabel(h.sev)})
-  • Location: ${h.lat}, ${h.lng}
-  • Details: ${h.note || c.hint}
-  • Reported: ${today}
-  • Community confirmations: ${h.votes}
-
-A photo is attached for reference. Could someone take a look when possible? Happy to provide any additional detail.
-
-Thank you for keeping our roads and trails safe,
-${state.profile.name}
-(sent via PulsePath)`;
-
+  const z = zoneForPoint(h.lat, h.lng);
+  const clearable = h.sev <= 2 && (h.cat === "branch" || h.cat === "dumping") && h.status !== "cleared";
   openSheet(`
-    <h2>✉️ Municipal email draft</h2>
-    <p class="sub">Naturally-worded, ready to send to local public works / FixItMarin.</p>
-    <div class="mini" style="margin-bottom:10px"><b style="font-size:12px">To:</b> <span>publicworks@marincounty.gov</span></div>
-    <div class="mini" style="margin-bottom:12px"><b style="font-size:12px">Subject:</b> <span>${c.label} hazard report — ${h.lat}, ${h.lng}</span></div>
-    <div class="email-preview">${body.replace(/</g, "&lt;")}</div>
-    <button class="btn accent mt" data-act="send-email" data-id="${id}">📤 Open in mail app</button>
-    <button class="btn ghost mt" data-act="copy-email">📋 Copy text</button>
-  `, "Email");
-  state._lastEmail = { to: "publicworks@marincounty.gov", subject: `${c.label} hazard report — ${h.lat}, ${h.lng}`, body };
+    <div class="row">
+      <div class="ico" style="width:44px;height:44px;border-radius:11px;display:grid;place-items:center;font-size:21px;background:${c.color};color:#fff">${c.icon}</div>
+      <div style="flex:1">
+        <h2 style="margin:0">${c.label}</h2>
+        <p class="muted">${h.status === "verified" ? "✅ verified" : h.status === "cleared" ? "🧹 cleared" : "🕓 unverified"} · ${h.votes} confirmation${h.votes === 1 ? "" : "s"} · ${fmtAgo(h.createdAt)}</p>
+      </div>
+      <span style="font-weight:800;color:${sevColor(h.sev)}">${sevLabel(h.sev)}</span>
+    </div>
+    ${h.note ? `<p class="mt" style="font-size:13.5px;line-height:1.5">“${esc(h.note)}”</p>` : ""}
+    <div class="mini mt"><b>GPS</b><span>${h.lat.toFixed(5)}, ${h.lng.toFixed(5)}</span></div>
+    ${z ? `<div class="mini mt"><b>Zone</b><span>${esc(z.riskType)} — ${esc(z.title.split("—")[0].trim())}</span></div>` : ""}
+    ${h.status !== "cleared" ? `<button class="btn mt" data-act="pin-confirm" data-id="${h.id}">👍 Confirm it's there</button>` : ""}
+    <button class="btn accent mt" data-act="pin-email" data-id="${h.id}">✉️ Draft municipal report</button>
+    ${clearable ? `<button class="btn ghost mt" data-act="pin-clear" data-id="${h.id}">🧹 I safely cleared this</button>` : ""}
+  `);
 }
-function sendEmail(id) {
-  const e = state._lastEmail;
-  if (!e) return;
-  const url = `mailto:${e.to}?subject=${encodeURIComponent(e.subject)}&body=${encodeURIComponent(e.body)}`;
-  try { window.location.href = url; } catch (err) {}
-  state.profile.emails++;
+function openCluster(ids) {
+  const items = ids.map(id => allHazards().find(h => h.id === id)).filter(Boolean);
+  openSheet(`
+    <h2>${items.length} reports here</h2>
+    <p class="sub">Multiple reports at this location — likely the same hazard.</p>
+    ${items.map(h => {
+      const c = CATEGORIES[h.cat];
+      return `<div class="list-row" data-act="pin-open" data-id="${h.id}" style="cursor:pointer">
+        <span style="font-size:17px">${c.icon}</span>
+        <span style="flex:1"><b>${c.label}</b> · ${sevLabel(h.sev)}<br><span class="muted">${esc((h.note || "").slice(0, 48))}</span></span>
+        <span class="muted">›</span>
+      </div>`;
+    }).join("")}
+  `);
+}
+function confirmPin(id) {
+  const h = state.hazards.find(x => x.id === id);
+  if (!h) { toast("Community pin — confirmations sync later", "", 2400); closeSheet(); return; }
+  h.votes += 1;
+  if (h.votes >= 3 && h.status === "unverified") { h.status = "verified"; toast("✅ Now verified by the community", "good"); }
+  else toast("👍 Confirmation added", "good");
+  state.profile.points += 1;
+  save();
+  MapCtl.refreshPins();
+  closeSheet();
+}
+
+/* ---- Civic email drafter (Novato directory routing) ---- */
+function openEmailDraft(id) {
+  const h = allHazards().find(x => x.id === id);
+  if (!h) return;
+  const c = CATEGORIES[h.cat];
+  const draft = buildCivicEmail(h, c.label, state.profile.name);
+  window._lastDraft = { draft, id };
+  openSheet(`
+    <h2>✉️ Municipal report</h2>
+    <p class="sub">Routed via the official Novato process for this hazard type. <b>Not for emergencies</b> — call ${NOVATO_EMERGENCY.emergency.tel}, or after-hours Public Works at ${NOVATO_EMERGENCY.afterHours.tel}.</p>
+    ${draft.to ? `<div class="mini" style="margin-bottom:8px"><b>To</b><span>${draft.to}</span></div>` : `<div class="mini" style="margin-bottom:8px"><b>Route</b><span>Online form only (no direct email for this type)</span></div>`}
+    <div class="mini" style="margin-bottom:10px"><b>Subject</b><span>${esc(draft.subject)}</span></div>
+    <div class="email-preview">${esc(draft.body)}</div>
+    ${draft.mailto ? `<button class="btn accent mt" data-act="email-send">📤 Open in mail app</button>` : ""}
+    <a class="btn ghost mt" href="${draft.formUrl}" target="_blank" rel="noopener" data-act="email-form">🌐 Open official reporting form</a>
+    <button class="btn ghost mt" data-act="email-copy">📋 Copy text</button>
+  `);
+}
+function sendEmailDraft() {
+  const d = window._lastDraft;
+  if (!d || !d.draft.mailto) return;
+  try { window.location.href = d.draft.mailto; } catch (e) {}
+  state.profile.emails += 1;
+  state.profile.points += 2;
+  pushHistory("✉️", "Drafted a municipal hazard report");
   save();
   closeSheet();
-  mascot("Email sent — civic hero! 🦦");
   toast("✉️ Draft opened in your mail app", "good");
 }
+function copyEmailDraft() {
+  const d = window._lastDraft;
+  if (!d) return;
+  const text = `To: ${d.draft.to || "(use the online form)"}\nSubject: ${d.draft.subject}\n\n${d.draft.body}`;
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+    .then(() => toast("📋 Copied", "good"))
+    .catch(() => toast("Copy manually from the preview", "warn"));
+}
 
-function openClearing() {
-  if (!state.ageConfirmed) {
-    openSheet(`
-      <h2>🧹 Safe Clearing Guide</h2>
-      <p class="sub">Before we show clearing steps, please confirm your age. PulsePath provides guidance only and assumes zero liability.</p>
-      <div class="card" style="background:var(--surface-2);border:none">
-        <p style="font-size:13px">⚠️ Never clear anything near traffic, on steep/unstable ground, or that's too heavy to move comfortably. When in doubt, just report it.</p>
+/* ---- Community Resolution (clear a minor hazard) ---- */
+function openClearing(id) {
+  // Liability disclaimer MUST appear before any clearing guidance (spec).
+  openSheet(`
+    <h2>🧹 Before you touch anything</h2>
+    <div class="card" style="background:var(--accent-soft);border-color:var(--accent)">
+      <p style="font-size:11.5px;line-height:1.6;user-select:text">${esc(NOVATO_MUNICIPAL_DIRECTORY.disclaimer)}</p>
+    </div>
+    <p class="muted">Only clear something if it is small, light, away from traffic, and obviously safe — a fallen branch on a flat trail, not a slide area, spill, or anything near cars.</p>
+    <button class="btn mt" data-act="clear-accept" data-id="${id}">I understand &amp; accept — continue</button>
+    <button class="btn ghost mt" data-act="close-sheet">Cancel</button>
+  `);
+}
+function openClearingStep2(id) {
+  if (!state.ageConfirmed) { closeSheet(); openAgeSheet(() => openClearing(id)); return; }
+  openSheet(`
+    <h2>🧹 Mark as cleared</h2>
+    <p class="sub">Take an "after" photo so the community can see it's handled.</p>
+    <label class="btn ghost" style="text-align:center">📷 After photo (optional)<input type="file" accept="image/*" capture="environment" id="clearPhoto" style="display:none"></label>
+    <p class="muted mt" id="clearPhotoNote"></p>
+    <button class="btn mt" data-act="clear-commit" data-id="${id}">✅ Confirm cleared (+1 point)</button>
+  `);
+  const fi = $("#clearPhoto");
+  if (fi) fi.addEventListener("change", () => { $("#clearPhotoNote").textContent = "📷 After photo attached — stored on-device."; });
+}
+function commitClearing(id) {
+  const h = state.hazards.find(x => x.id === id);
+  if (h) h.status = "cleared";
+  state.profile.cleared += 1;
+  state.profile.points += 1; // light gamification: one simple profile point
+  pushHistory("🧹", `Cleared a ${h ? CATEGORIES[h.cat].label.toLowerCase() : "hazard"} — thank you`);
+  save();
+  MapCtl.refreshPins();
+  closeSheet();
+  toast("🧹 Marked cleared — +1 civic point", "good");
+}
+
+/* ================= SETTINGS ================= */
+function renderSettings() {
+  const s = state.settings;
+  const sw = (key, on) => `<div class="switch ${on ? "on" : ""}" data-act="toggle" data-key="${key}"></div>`;
+  $("#screen-settings").innerHTML = `
+    <h1>Settings</h1>
+    <p class="sub">Hardware, power, sync and your civic profile.</p>
+
+    <div class="card">
+      <div class="row">
+        <div style="width:46px;height:46px;border-radius:50%;background:var(--brand);color:#fff;display:grid;place-items:center;font-size:20px;font-weight:800">${esc(state.profile.name[0] || "n")}</div>
+        <div style="flex:1">
+          <b style="font-size:15px">${esc(state.profile.name)}</b>
+          <p class="muted">${state.profile.points} civic points · ${state.profile.mapped} mapped · ${state.profile.cleared} cleared</p>
+        </div>
+        <button class="btn ghost sm" data-act="rename">Edit</button>
       </div>
-      <button class="btn mt" data-act="confirm-age">✅ I'm 13 or older — continue</button>
-      <button class="btn ghost mt" data-act="close-sheet">Cancel</button>
-    `, "Safety");
-    return;
-  }
-  openSheet(`
-    <h2>🧹 Clearing a loose branch</h2>
-    <p class="sub">Simple steps for minor path obstacles only.</p>
-    <ol style="font-size:14px;line-height:1.9;padding-left:18px">
-      <li>Check for traffic, bikes & wildlife first.</li>
-      <li>Confirm it's light enough to lift comfortably.</li>
-      <li>Drag — don't lift overhead — to the side of the path.</li>
-      <li>Place it well clear of the trail, off any runoff channel.</li>
-      <li>Snap a photo & log it cleared so others know.</li>
-    </ol>
-    <div class="card" style="background:var(--accent-soft);border:none;color:#9a4a16"><p style="font-size:12px">Zero-liability: you act at your own discretion. Leave anything large, heavy, or hazardous to the pros.</p></div>
-    <button class="btn ghost mt" data-act="close-sheet">Got it</button>
-  `, "Safety");
+    </div>
+
+    <div class="card">
+      <h3>Mode</h3>
+      <div class="seg">
+        <button class="${s.mode === "bike" ? "on" : ""}" data-act="mode" data-mode="bike">🚲 Bike</button>
+        <button class="${s.mode === "walk" ? "on" : ""}" data-act="mode" data-mode="walk">🚶 Walk</button>
+      </div>
+      <p class="muted mt">Auto-detection arms at riding speeds (6–22 mph). Walk mode focuses on manual capture + proximity voice alerts.</p>
+    </div>
+
+    <div class="card">
+      <h3>Sync &amp; power</h3>
+      <div class="switch-row">
+        <div><div class="lbl">Auto-Upload</div><div class="hint">Every 10 minutes, decrypt staged reports and publish to the community database. Off = manual approval in Review.</div></div>
+        ${sw("autoUpload", s.autoUpload)}
+      </div>
+      <div class="switch-row">
+        <div><div class="lbl">Low Power Mode</div><div class="hint">Disables the acoustic (sonar) sensor factor entirely to save battery. Fusion runs IMU-only.</div></div>
+        ${sw("lowPower", s.lowPower)}
+      </div>
+      <div class="switch-row">
+        <div><div class="lbl">Voice alerts (TTS)</div><div class="hint">Spoken warnings in your headphones when approaching verified hazards.</div></div>
+        ${sw("tts", s.tts)}
+      </div>
+      <div class="switch-row">
+        <div><div class="lbl">Dark mode</div></div>
+        ${sw("dark", s.dark)}
+      </div>
+      <div class="switch-row">
+        <div><div class="lbl">Alert radius</div><div class="hint">Proximity voice alerts trigger inside this distance.</div></div>
+        <input type="number" min="40" max="400" step="10" value="${s.radiusM}" id="radiusInput" style="width:76px;text-align:center">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Novato municipal directory</h3>
+      <p class="muted" style="margin-bottom:6px">Where each report type is routed. Emergencies: <a href="tel:911"><b>911</b></a> · After-hours Public Works: <a href="tel:4158974361"><b>415-897-4361</b></a></p>
+      ${Object.entries(NOVATO_MUNICIPAL_DIRECTORY.routing).map(([k, r]) => `
+        <div class="dir-route">
+          <b>${k.replace(/_/g, " ")}</b>
+          <div class="to">${r.targetEmail || "online form only"}</div>
+          <div class="form">${r.contactFormEndpoint}</div>
+        </div>`).join("")}
+    </div>
+
+    <div class="card">
+      <h3>Data</h3>
+      <button class="btn ghost sm" data-act="export-csv">⬇️ CSV</button>
+      <button class="btn ghost sm mt" data-act="export-geojson">⬇️ GeoJSON</button>
+      <button class="btn ghost sm mt" data-act="fetch-community">☁️ Refresh community pins</button>
+      <p class="muted mt">Backend: ${Sync.configured ? "Supabase connected" : "not configured"}${Sync.lastError ? ` · last error: ${esc(Sync.lastError)}` : ""}</p>
+    </div>
+
+    <div class="card">
+      <h3>Demo &amp; diagnostics</h3>
+      <p class="muted" style="margin-bottom:8px">Feed synthetic 1-second buffers through the real classifier (desktop validation of the 7-scenario matrix).</p>
+      <div class="grid-2">
+        <button class="btn ghost sm" data-act="sim" data-s="pothole">🕳️ Pothole</button>
+        <button class="btn ghost sm" data-act="sim" data-s="cattle_guard">🐮 Cattle guard</button>
+        <button class="btn ghost sm" data-act="sim" data-s="manhole">⭕ Manhole</button>
+        <button class="btn ghost sm" data-act="sim" data-s="rut">🚵 Trail rut</button>
+        <button class="btn ghost sm" data-act="sim" data-s="branch">🌿 Low branch</button>
+        <button class="btn ghost sm" data-act="sim" data-s="speed_bump">🛑 Speed bump</button>
+        <button class="btn ghost sm" data-act="sim" data-s="severe">⚠️ Severe fall</button>
+        <button class="btn ghost sm" data-act="sim-prox">🔊 Proximity alert</button>
+      </div>
+      <button class="btn danger sm mt" data-act="reset">Reset app</button>
+    </div>
+
+    <p class="muted center" style="padding-bottom:8px">motio · Novato, CA · reports are encrypted on-device (AES-256-GCM)</p>
+  `;
+  const ri = $("#radiusInput");
+  if (ri) ri.addEventListener("change", () => {
+    state.settings.radiusM = Math.max(40, Math.min(400, +ri.value || 120));
+    save();
+  });
 }
 
-function runCalibration() {
-  let t = 10;
-  const samples = [];
-  openSheet(`
-    <h2 class="center">🎚️ Calibration</h2>
-    <p class="sub center">Ride or walk normally for a few seconds so we can learn your bike & terrain baseline.</p>
-    <div class="center" style="font-size:64px;font-weight:800;color:var(--brand)" id="calCount">${t}</div>
-    <div class="meter" id="calMeter"></div>
-    <p class="muted center mt" id="calNote">Sampling your motion…</p>
-  `, "Calibration", "cal");
-  drawCalMeter();
-  Sensors.startMotion((m) => { samples.push(m); pushCalMeter(m); });
-  let fake = null;
-  if (!Sensors.motionSupported || samples.length === 0) {
-    fake = setInterval(() => { const m = 9.8 + (Math.random() - 0.5) * 2; samples.push(m); pushCalMeter(m); }, 90);
-  }
-  const iv = setInterval(() => {
-    t--;
-    const c = $("#calCount"); if (c) c.textContent = t;
-    if (t <= 0) {
-      clearInterval(iv); if (fake) clearInterval(fake);
-      Sensors.stopMotion();
-      const avg = samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 9.8;
-      const peak = samples.length ? Math.max(...samples) : 11;
-      // Threshold = baseline + headroom above observed peak jitter.
-      state.settings.threshold = +clamp(peak + (peak - avg) + 1.5, 11, 18).toFixed(1);
-      state.settings.calibrated = true;
-      save();
-      const note = $("#calNote");
-      if (note) note.innerHTML = `✅ Calibrated! Trip threshold set to <b>${state.settings.threshold.toFixed(1)}g</b>`;
-      const cc = $("#calCount"); if (cc) cc.textContent = "✓";
-      toast("🎚️ Calibration complete", "good");
-      setTimeout(() => { closeSheet(); if (currentScreen === "track") renderModePanel(); if (currentScreen === "settings") renderSettings(); }, 1400);
-    }
-  }, 1000);
-}
-function drawCalMeter() {
-  const m = $("#calMeter"); if (!m) return; m.innerHTML = "";
-  for (let i = 0; i < 40; i++) { const b = document.createElement("div"); b.className = "bar"; b.style.height = "2px"; m.appendChild(b); }
-}
-function pushCalMeter(mag) {
-  const m = $("#calMeter"); if (!m) return; const bars = $$(".bar", m); if (!bars.length) return;
-  for (let i = 0; i < bars.length - 1; i++) bars[i].style.height = bars[i + 1].style.height;
-  bars[bars.length - 1].style.height = clamp((mag - 6) / 18 * 100, 2, 100) + "%";
-}
-
-/* --- Export --- */
+/* ---- exports ---- */
 function download(name, text, type) {
   const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
@@ -1162,424 +1084,284 @@ function download(name, text, type) {
   toast(`⬇️ Exported ${name}`, "good");
 }
 function exportCSV() {
-  const rows = [["id", "category", "severity", "status", "votes", "lat", "lng", "reported", "note"]];
-  state.hazards.forEach(h => rows.push([h.id, h.cat, h.sev, h.status, h.votes, h.lat, h.lng,
-    new Date(h.createdAt).toISOString(), `"${(h.note || "").replace(/"/g, '""')}"`]));
-  download("pulsepath_hazards.csv", rows.map(r => r.join(",")).join("\n"), "text/csv");
+  const rows = [["id", "type", "severity", "status", "lat", "lng", "zone", "note", "created"]];
+  for (const h of allHazards()) {
+    const z = zoneForPoint(h.lat, h.lng);
+    rows.push([h.id, h.cat, h.sev, h.status, h.lat, h.lng, z ? z.id : "", `"${(h.note || "").replace(/"/g, '""')}"`, new Date(h.createdAt).toISOString()]);
+  }
+  download("motio-hazards.csv", rows.map(r => r.join(",")).join("\n"), "text/csv");
 }
 function exportGeoJSON() {
   const fc = {
     type: "FeatureCollection",
-    features: state.hazards.map(h => ({
+    features: allHazards().map(h => ({
       type: "Feature",
       geometry: { type: "Point", coordinates: [h.lng, h.lat] },
-      properties: { category: h.cat, severity: h.sev, status: h.status, votes: h.votes, note: h.note, reported: new Date(h.createdAt).toISOString() },
+      properties: { id: h.id, type: h.cat, severity: h.sev, status: h.status, note: h.note || "", created: new Date(h.createdAt).toISOString() },
     })),
   };
-  download("pulsepath_hazards.geojson", JSON.stringify(fc, null, 2), "application/geo+json");
+  download("motio-hazards.geojson", JSON.stringify(fc, null, 2), "application/geo+json");
 }
 
-/* --- Proximity engine --- */
-const alertedPins = new Set();
-function checkProximity() {
-  const ru = state.settings.radius / 150; // meters -> xy units (~150m per unit)
-  state.hazards.filter(h => h.status === "unverified").forEach(h => {
-    const d = dist(state.me, h);
-    if (d < ru) {
-      if (!alertedPins.has(h.id)) {
-        alertedPins.add(h.id);
-        Sensors.buzz([60, 40, 60]);
-        const c = CATEGORIES[h.cat];
-        toast(`⚠️ Unverified ${c.label} nearby — can you confirm it?`, "alert", 3200);
-        if (state.settings.tts) Sensors.speak(`Heads up. ${c.label} reported ahead.`);
-      }
-    } else if (d > ru * 1.4) {
-      alertedPins.delete(h.id);
-    }
-  });
-}
-
-/* --- Simulated ride --- */
-function simulateRide() {
-  toast("🛰️ Simulating a ride across the map…");
-  const path = [{ x: 30, y: 34 }, { x: 40, y: 42 }, { x: 50, y: 52 }, { x: 64, y: 62 }, { x: 74, y: 56 }];
-  let i = 0, step = 0;
-  const iv = setInterval(() => {
-    const a = path[i], b = path[i + 1];
-    if (!b) { clearInterval(iv); state.profile.miles += 1; save(); mascot("Route complete! 🦦"); return; }
-    step += 0.06;
-    state.me.x = a.x + (b.x - a.x) * step;
-    state.me.y = a.y + (b.y - a.y) * step;
-    if (step >= 1) { step = 0; i++; }
-    if (currentScreen === "map") updateMeLayer();
-    checkProximity();
-    if (Math.random() < 0.04) logPulse(state.settings.threshold + Math.random() * 3);
-  }, 120);
-}
-
-/* ============================================================
-   SHEETS
-   ============================================================ */
-function openSheet(html, title, kind) {
-  const sheet = $("#sheet");
-  sheet.dataset.kind = kind || "";
-  if (html !== null && html !== undefined) sheet.innerHTML = `<div class="grab" data-act="close-sheet"></div>` + html;
-  $("#scrim").classList.add("show");
-  sheet.classList.add("show");
-}
-function setSheet(html) { $("#sheet").innerHTML = `<div class="grab" data-act="close-sheet"></div>` + html; }
-function closeSheet() {
-  $("#sheet").classList.remove("show");
-  $("#scrim").classList.remove("show");
-  Sensors.stopCamera();
-}
-
-/* ============================================================
-   Action delegation
-   ============================================================ */
-document.addEventListener("click", (e) => {
-  const t = e.target.closest("[data-act]");
-  if (!t) return;
-  const a = t.dataset.act, d = t.dataset;
-  switch (a) {
-    /* nav */
-    case "tab": showScreen(d.tab); break;
-    case "go-track": showScreen("track"); break;
-    case "go-settings": showScreen("settings"); break;
-    case "back": showScreen("home"); break;
-    case "close-sheet": closeSheet(); break;
-
-    /* modes */
-    case "set-mode":
-      state.settings.mode = d.mode; save(); refreshModePill();
-      if (d.stay === "track" || currentScreen === "track") { renderTrack(); }
-      else renderHome();
-      toast(`${MODE_META[d.mode].icon} ${MODE_META[d.mode].label} selected`);
-      break;
-
-    /* map */
-    case "toggle-filter": state.filters[d.cat] = !state.filters[d.cat]; save(); refreshMarkers(); renderMapOverlay(); break;
-    case "open-pin": openPin(d.id); break;
-    case "open-cluster": openCluster(d.ids); break;
-    case "cycle-weather": cycleWeather(); break;
-    case "locate-me": case "map-recenter": recenterMap(); break;
-    case "map-style": cycleMapStyle(); break;
-    case "map-offline": toggleOffline(); break;
-    case "map-zoom-in": if (lmap) lmap.zoomIn(); break;
-    case "map-zoom-out": if (lmap) lmap.zoomOut(); break;
-    case "map-search": doMapSearch(); break;
-    case "open-demo": openDemoMenu(); break;
-    case "demo-sim-ride": closeSheet(); simulateRide(); break;
-    case "demo-drop-pin": closeSheet(); if (lmap) { const c = lmap.getCenter(); openCapture(geoToXY(c.lat, c.lng)); } break;
-    case "demo-jump": closeSheet(); if (lmap) lmap.flyTo([(GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2, (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2], 13, { duration: .6 }); break;
-
-    /* trips */
-    case "view-trip": viewTrip(d.id); break;
-    case "delete-trip": deleteTrip(d.id); break;
-
-    /* pin actions */
-    case "confirm-pin": confirmPin(d.id); break;
-    case "speak-pin": { const h = state.hazards.find(x => x.id === d.id); if (h) { Sensors.speak(`${CATEGORIES[h.cat].label}, severity ${h.sev}, ${h.note || ""}`); toast("🔊 Reading aloud"); } break; }
-    case "draft-email": draftEmail(d.id); break;
-    case "send-email": sendEmail(d.id); break;
-    case "copy-email": navigator.clipboard?.writeText(state._lastEmail?.body || ""); toast("📋 Copied"); break;
-    case "rate-pin": ratePin(d.id); break;
-    case "set-rating": applyRating(d.id, +d.sev); break;
-    case "delete-pin": deletePin(d.id); break;
-
-    /* capture */
-    case "open-capture": openCapture(); break;
-    case "pick-photo": $("#photoInput").click(); break;
-    case "draft-cat": draft.cat = d.cat; renderCapture(); break;
-    case "draft-sev": draft.sev = +d.sev; renderCapture(); break;
-    case "save-capture": saveCapture(); break;
-
-    /* inbox */
-    case "approve-q": approveQ(d.id); break;
-    case "reject-q": rejectQ(d.id); break;
-    case "approve-all": approveAll(); break;
-
-    /* tracking */
-    case "toggle-track": toggleTrack(); break;
-    case "sim-pulse": logPulse(state.settings.threshold + 1 + Math.random() * 3); pushMeter(state.settings.threshold + 2); break;
-    case "calibrate": runCalibration(); break;
-    case "connect-health": state._healthConnected = true; renderModePanel(); toast("⌚ Connected to health framework", "good"); break;
-    case "demo-tts": Sensors.speak("Caution. Pothole in 40 meters on your right."); toast("🔊 Playing readout"); break;
-    case "start-patrol": startPatrol(); break;
-    case "stop-patrol": Sensors.stopCamera(); renderModePanel(); toast("⏹ Camera stopped"); break;
-    case "sim-anomaly": simAnomaly(); break;
-    case "sim-drive": simDrive(); break;
-
-    /* misc */
-    case "open-clearing": openClearing(); break;
-    case "confirm-age": state.ageConfirmed = true; save(); openClearing(); break;
-    case "export-csv": exportCSV(); break;
-    case "export-geojson": exportGeoJSON(); break;
-    case "reset-app": resetApp(); break;
-    case "pick-avatar": $("#avatarInput").click(); break;
-    case "rename": renameProfile(); break;
-    case "show-guide": startOnboarding(); break;
-  }
-});
-
-/* toggles + ranges */
-document.addEventListener("change", (e) => {
-  const tg = e.target.closest("[data-toggle]");
-  if (tg) {
-    const k = tg.dataset.toggle;
-    state.settings[k] = tg.checked; save();
-    if (k === "dark") applyTheme();
-    if (k === "voice") tg.checked ? startVoice() : Sensors.stopVoice(setVoiceUI);
-    return;
-  }
-});
-document.addEventListener("input", (e) => {
-  const r = e.target.closest("[data-range]");
-  if (r) {
-    const k = r.dataset.range;
-    state.settings[k] = k === "threshold" ? +r.value : +r.value;
-    if (k === "radius") { const v = $("#radiusVal"); if (v) v.textContent = state.settings.radius + " m"; if (currentScreen === "map") renderMap(); }
-    if (k === "threshold") { const v = $("#threshVal"); if (v) v.textContent = state.settings.threshold.toFixed(1) + " g"; drawMeter(); }
-    save();
-  }
-});
-
-/* file inputs */
-document.addEventListener("change", (e) => {
-  if (e.target.id === "photoInput") readImage(e.target, (data) => { draft.photo = data; renderCapture(); });
-  if (e.target.id === "avatarInput") readImage(e.target, (data) => { state.profile.photo = data; save(); renderProfile(); });
-});
-function readImage(input, cb) {
-  const f = input.files && input.files[0];
-  if (!f) return;
-  const r = new FileReader();
-  r.onload = () => cb(r.result);
-  r.readAsDataURL(f);
-}
-
-/* ---------------- Action implementations ---------------- */
-function confirmPin(id) {
-  const h = state.hazards.find(x => x.id === id);
-  if (!h) return;
-  h.votes++; if (h.status === "unverified") h.status = "verified";
-  alertedPins.delete(id);
-  state.profile.verified++;
-  save(); closeSheet(); renderMap();
-  mascot(); toast("✅ Confirmed — thanks for checking!", "good");
-  checkMedals();
-}
-function ratePin(id) {
-  openSheet(`
-    <h2 class="center">⭐ Rate severity</h2>
-    <p class="sub center">How dangerous is this right now?</p>
-    <div class="sev-pick" style="margin-top:16px">
-      ${[1, 2, 3, 4, 5].map(n => `<button class="sev-opt" data-act="set-rating" data-id="${id}" data-sev="${n}" style="background:${sevColor(n)};color:#fff;border:none">${n}</button>`).join("")}
-    </div>
-    <p class="muted center">1 = minor · 5 = severe</p>
-  `, "Rate");
-}
-function applyRating(id, sev) {
-  const h = state.hazards.find(x => x.id === id);
-  if (h) { h.sev = sev; save(); }
-  closeSheet(); renderMap();
-  toast(`⭐ Rated ${sev}/5 · ${sevLabel(sev)}`, "good");
-}
-function deletePin(id) {
-  state.hazards = state.hazards.filter(x => x.id !== id);
-  save(); closeSheet(); renderMap();
-  toast("🗑️ Pin removed");
-}
-function saveCapture() {
-  const item = {
-    id: uid(), type: "photo", cat: draft.cat, sev: draft.sev, photo: draft.photo,
-    x: draft.x, y: draft.y, createdAt: Date.now(),
-    note: draft.photo ? "Quick-capture photo" : "Quick capture (no photo)",
-  };
-  Object.assign(item, xyToGeo(item.x, item.y));
-  state.queue.unshift(item);
-  save(); closeSheet(); updateInboxBadge();
-  toast("📸 Saved to review queue", "good");
-}
-function approveQ(id) {
-  const q = state.queue.find(x => x.id === id);
-  if (!q) return;
-  postHazard(q);
-  state.queue = state.queue.filter(x => x.id !== id);
-  save(); updateInboxBadge(); renderInbox();
-  toast("✅ Posted to community map", "good");
-}
-function rejectQ(id) {
-  state.queue = state.queue.filter(x => x.id !== id);
-  save(); updateInboxBadge(); renderInbox();
-  toast("🗑️ Discarded");
-}
-function approveAll() {
-  state.queue.forEach(postHazard);
-  state.queue = [];
-  save(); updateInboxBadge(); renderInbox();
-  mascot(); toast("✅ All reports posted!", "good");
-}
-function postHazard(q) {
-  const h = {
-    id: uid(), cat: q.cat, x: q.x, y: q.y, sev: q.sev, status: "verified",
-    votes: 1, note: q.note, photo: q.photo, createdAt: Date.now(), ...xyToGeo(q.x, q.y),
-  };
-  state.hazards.push(h);
-  state.profile.mapped++;
-  state.profile.carbon = +(state.profile.carbon + 0.3).toFixed(1);
-  checkMedals();
-}
-function checkMedals() {
-  const u = unlockedMedals();
-  if (u.length > (state._medalCount || 3)) {
-    const newest = u[u.length - 1];
-    mascot(`🏅 Unlocked: ${newest.name}!`);
-  }
-  state._medalCount = u.length;
-}
-
-function cycleWeather() {
-  const i = WEATHER_STATES.findIndex(w => w.id === state.settings.weather);
-  const next = WEATHER_STATES[(i + 1) % WEATHER_STATES.length];
-  state.settings.weather = next.id; save();
-  if (currentScreen === "map") renderMap();
-  if (currentScreen === "home") renderHome();
-  toast(`${next.icon} ${next.label}`);
-}
-async function locateMe() {
-  toast("📍 Getting your location…");
-  const pos = await Sensors.getPosition();
-  if (pos) {
-    state.me = geoToXY(pos.lat, pos.lng);
-    toast("📍 Location found", "good");
-  } else {
-    // demo nudge
-    state.me = { x: clamp(state.me.x + (Math.random() - 0.5) * 20, 10, 90), y: clamp(state.me.y + (Math.random() - 0.5) * 20, 10, 90) };
-    toast("📍 GPS unavailable — using demo position");
-  }
-  save(); checkProximity();
-  const g = xyToGeo(state.me.x, state.me.y);
-  if (lmap) { updateMeLayer(); lmap.flyTo([g.lat, g.lng], Math.max(lmap.getZoom(), 14), { duration: .6 }); }
-}
-
-async function startPatrol() {
-  const view = $("#patrolView");
-  if (!view) return;
-  view.innerHTML = `<video id="patrolVideo" playsinline></video>`;
-  const ok = await Sensors.startCamera($("#patrolVideo"));
-  if (!ok) {
-    view.innerHTML = `<span class="e">🚫</span><span>Camera unavailable in this preview</span>`;
-    toast("🚫 Camera not available");
-  } else {
-    toast("📷 Patrol watch active");
-  }
-}
-function simAnomaly() {
-  Sensors.buzz([80, 40, 80]);
-  toast("🔍 Structural anomaly detected — tap to document!", "alert", 3500);
-  if (state.settings.tts) Sensors.speak("Possible road block detected ahead.");
-  setTimeout(() => openCapture(), 600);
-}
-function simDrive() {
-  toast("🚗 Vehicle-speed travel detected (running passively)");
-  const miles = 6, co2 = (miles * 0.404).toFixed(1);
-  setTimeout(() => {
-    openSheet(`
-      <h2>☀️ Good morning!</h2>
-      <p class="sub">About yesterday's ${miles}-mile drive…</p>
-      <div class="card" style="background:var(--brand-soft);border:none">
-        <div style="font-size:34px;font-weight:800;color:var(--brand-deep)">${co2} kg CO₂</div>
-        <p style="font-size:13px">is roughly what you'd save by biking that same trip next time. 🚲</p>
-      </div>
-      <p class="sub">No pressure — just a friendly nudge. Every mile counts toward the district goal.</p>
-      <button class="btn mt" data-act="close-sheet">Nice, thanks!</button>
-    `, "Nudge");
-  }, 900);
-}
-
-function renameProfile() {
-  const n = prompt("Display name", state.profile.name);
-  if (n && n.trim()) { state.profile.name = n.trim().slice(0, 24); save(); renderProfile(); }
-}
-function resetApp() {
-  if (!confirm("Reset all demo data and reload?")) return;
-  localStorage.removeItem(STORE_KEY);
-  location.reload();
-}
-
-/* ---------------- Voice ---------------- */
-function setVoiceUI(on) {
-  const b = $("#voiceBtn");
-  b.style.background = on ? "var(--accent)" : "var(--surface-2)";
-  b.style.color = on ? "#fff" : "";
-}
-function startVoice() {
-  const ok = Sensors.startVoice(() => {
-    // "Log Danger" heard -> instant pin at current position
-    logPulse(state.settings.threshold + 1);
-    toast('🎙️ "Log Danger" heard — pin dropped!', "alert");
-  }, setVoiceUI);
-  if (!ok) { toast("🎙️ Voice recognition not supported here"); state.settings.voice = false; }
-}
-function toggleVoice() {
-  if (Sensors._recognition) { Sensors.stopVoice(setVoiceUI); state.settings.voice = false; toast("🎙️ Voice off"); }
-  else { state.settings.voice = true; startVoice(); toast('🎙️ Listening for "Log Danger"', "good"); }
-  save();
-}
-
-/* ---------------- Onboarding ---------------- */
+/* ================= ONBOARDING ================= */
 const SLIDES = [
-  { big: "🦦", h: "Welcome to PulsePath", p: "Map road & trail hazards across Marin — for commuters, hikers and bikers alike." },
-  { big: "🚲", h: "Automatic logging", p: "Bike, walk, patrol or drive. Sensors quietly catch potholes & ruts and auto-tag GPS so you keep your hands on the bars." },
-  { big: "🔒", h: "Private by default", p: "Auto-logs stay on your device in a review queue. Nothing posts publicly until you confirm it. Public coordinates are rounded for safety." },
-  { big: "🌍", h: "Real civic impact", p: "Confirm hazards, draft city emails, and watch your carbon offset & district map grow." },
+  {
+    art: `<div class="wordmark" style="font-size:44px">mot<span class="wm-i">ı<span class="wm-dot" style="width:12px;height:12px;top:-12px"></span></span>o</div>`,
+    h: "Welcome to motio",
+    p: "Novato's community network for road & trail hazards. Ride or walk — your phone's sensors map what needs fixing.",
+  },
+  {
+    art: "🔐",
+    h: "Private by design",
+    p: "Detections stage on your phone encrypted with AES-256-GCM. Nothing uploads until a 10-minute timer (or you) approves it — and you get a 10-second cancel window on every auto-detection.",
+  },
+  {
+    art: "🎂",
+    h: "Age check",
+    p: "motio involves being on public roads and trails. Please confirm you're 13 or older.",
+    btn: { label: "✅ I'm 13 or older", act: "onb-age" },
+  },
+  {
+    art: "⚖️",
+    h: "Safety waiver",
+    waiver: true,
+    p: "",
+    btn: { label: "I accept the waiver", act: "onb-waiver" },
+  },
 ];
-let slideIdx = 0;
+let onbIdx = 0;
 function startOnboarding() {
-  slideIdx = 0;
-  $("#onb").classList.remove("hide");
+  onbIdx = 0;
+  $("#onb").classList.add("show");
   renderOnb();
 }
 function renderOnb() {
-  $("#onbSlides").style.transform = `translateX(-${slideIdx * 100}%)`;
-  $("#onbDots").innerHTML = SLIDES.map((_, i) => `<i class="${i === slideIdx ? "on" : ""}"></i>`).join("");
-  $("#onbNext").textContent = slideIdx === SLIDES.length - 1 ? "Get started" : "Next";
+  const sl = SLIDES[onbIdx];
+  $("#onbSlides").innerHTML = `
+    <div class="slide active">
+      <div class="art">${sl.art}</div>
+      <h2>${sl.h}</h2>
+      ${sl.waiver ? `<div class="waiver-box">${esc(NOVATO_MUNICIPAL_DIRECTORY.disclaimer)}<br><br>Do not use motio for emergencies. Life-threatening: call 911. After-hours Public Works (e.g. downed tree blocking a street): 415-897-4361.</div>` : `<p>${sl.p}</p>`}
+      ${sl.btn ? (() => {
+        const done = sl.btn.act === "onb-age" ? state.ageConfirmed : state.waiverAccepted;
+        return `<button class="btn ${done ? "ghost" : ""}" style="max-width:280px" data-act="${sl.btn.act}">${done ? "✅ Done" : sl.btn.label}</button>`;
+      })() : ""}
+    </div>`;
+  $("#onbDots").innerHTML = SLIDES.map((_, i) => `<i class="${i === onbIdx ? "on" : ""}"></i>`).join("");
+  $("#onbNext").textContent = onbIdx === SLIDES.length - 1 ? "Finish" : "Next";
 }
 function onbNext() {
-  if (slideIdx < SLIDES.length - 1) { slideIdx++; renderOnb(); }
-  else { $("#onb").classList.add("hide"); state.onboarded = true; save(); }
+  if (onbIdx < SLIDES.length - 1) { onbIdx++; renderOnb(); }
+  else finishOnboarding();
+}
+function finishOnboarding() {
+  state.onboarded = true;
+  save();
+  $("#onb").classList.remove("show");
+  renderHome();
 }
 
-/* ---------------- Boot ---------------- */
+/* Enforcement sheets (when skipped during onboarding). */
+function openAgeSheet(cb) {
+  window._afterAge = cb || null;
+  openSheet(`
+    <h2>🎂 Quick age check</h2>
+    <p class="sub">This action requires confirming you're 13 or older.</p>
+    <button class="btn" data-act="age-confirm">✅ I'm 13 or older</button>
+    <button class="btn ghost mt" data-act="close-sheet">Not now</button>
+  `);
+}
+function openWaiverSheet(cb) {
+  window._afterWaiver = cb || null;
+  openSheet(`
+    <h2>⚖️ Safety waiver</h2>
+    <div class="card" style="max-height:220px;overflow-y:auto"><p style="font-size:11.5px;line-height:1.6;user-select:text">${esc(NOVATO_MUNICIPAL_DIRECTORY.disclaimer)}</p></div>
+    <p class="muted">Emergencies: 911. After-hours Public Works: 415-897-4361.</p>
+    <button class="btn mt" data-act="waiver-accept">I understand &amp; accept</button>
+    <button class="btn ghost mt" data-act="close-sheet">Not now</button>
+  `);
+}
+
+/* ================= Sheet system ================= */
+let _sheetCleanup = null;
+function openSheet(html, onClose) {
+  _sheetCleanup = onClose || null;
+  $("#sheet").innerHTML = `<div class="grab" data-act="close-sheet"></div>` + html;
+  $("#sheet").classList.add("show");
+  $("#scrim").classList.add("show");
+}
+function closeSheet() {
+  $("#sheet").classList.remove("show");
+  $("#scrim").classList.remove("show");
+  if (_sheetCleanup) { try { _sheetCleanup(); } catch (e) {} _sheetCleanup = null; }
+}
+
+/* ================= Global event delegation ================= */
+document.addEventListener("click", async (e) => {
+  const t = e.target.closest("[data-act]");
+  if (!t) return;
+  const act = t.dataset.act;
+
+  switch (act) {
+    case "tab": showScreen(t.dataset.tab); break;
+    case "close-sheet": closeSheet(); break;
+
+    case "start-track": startTracking(); break;
+    case "end-track": endTracking(); break;
+
+    case "filter":
+      state.filters[t.dataset.cat] = !state.filters[t.dataset.cat];
+      save(); renderFilterChips(); MapCtl.refreshPins();
+      break;
+    case "map-locate": {
+      const pos = await Sensors.getPosition();
+      if (pos && MapCtl.map) { MapCtl.map.flyTo([pos.lat, pos.lng], 16); MapCtl.updateMe(pos); checkProximity(pos); }
+      else toast("Location unavailable", "warn");
+      break;
+    }
+    case "map-zones":
+      MapCtl.showZones = !MapCtl.showZones;
+      MapCtl.drawZones();
+      toast(MapCtl.showZones ? "▦ Risk corridors shown" : "▦ Risk corridors hidden");
+      break;
+    case "map-offline":
+      state.settings.offline = !state.settings.offline;
+      save();
+      $("#offlineBtn").textContent = MapCtl.isOffline() ? "📴" : "📶";
+      toast(state.settings.offline ? "📴 Offline tiles — serving from cache" : "📶 Online tiles", "", 2200);
+      if (MapCtl.tiles) MapCtl.tiles.redraw();
+      break;
+
+    case "pin-open": closeSheet(); setTimeout(() => openPin(t.dataset.id), 240); break;
+    case "pin-confirm": confirmPin(t.dataset.id); break;
+    case "pin-email": closeSheet(); setTimeout(() => openEmailDraft(t.dataset.id), 240); break;
+    case "pin-clear": closeSheet(); setTimeout(() => openClearing(t.dataset.id), 240); break;
+    case "clear-accept": closeSheet(); setTimeout(() => openClearingStep2(t.dataset.id), 240); break;
+    case "clear-commit": commitClearing(t.dataset.id); break;
+    case "email-send": sendEmailDraft(); break;
+    case "email-copy": copyEmailDraft(); break;
+    case "email-form":
+      state.profile.points += 1; pushHistory("🌐", "Opened an official reporting form"); save();
+      break;
+
+    case "cap-snap": snapCapturePhoto(); break;
+    case "cap-cat": Capture.cat = t.dataset.cat; renderCapPickers(); break;
+    case "cap-sev": Capture.sev = +t.dataset.sev; renderCapPickers(); break;
+    case "cap-dictate": toggleDictation(); break;
+    case "cap-save": saveCapture(); break;
+
+    case "inbox-approve": approveInboxItem(t.dataset.id); break;
+    case "inbox-discard":
+      await Sync.discard(t.dataset.id);
+      toast("🗑️ Discarded (never uploaded)");
+      renderInbox(); updateInboxBadge();
+      break;
+    case "inbox-approve-all": approveAllInbox(); break;
+    case "inbox-sync-now": approveAllInbox(); break;
+
+    case "toggle": {
+      const k = t.dataset.key;
+      state.settings[k] = !state.settings[k];
+      save();
+      t.classList.toggle("on", state.settings[k]);
+      if (k === "dark") applyTheme();
+      if (k === "autoUpload" && state.settings.autoUpload) Sync.flushIfAuto();
+      break;
+    }
+    case "mode":
+      state.settings.mode = t.dataset.mode;
+      save();
+      $("#modeChip").textContent = state.settings.mode;
+      renderSettings();
+      break;
+    case "rename": {
+      const n = prompt("Display name", state.profile.name);
+      if (n && n.trim()) { state.profile.name = n.trim().slice(0, 24); save(); renderSettings(); }
+      break;
+    }
+    case "export-csv": exportCSV(); break;
+    case "export-geojson": exportGeoJSON(); break;
+    case "fetch-community": {
+      toast("☁️ Fetching community reports…");
+      const remote = await Sync.fetchCommunity();
+      window._remoteHazards = remote;
+      toast(remote.length ? `☁️ ${remote.length} community reports loaded` : "No community reports yet (or offline)", remote.length ? "good" : "warn");
+      MapCtl.refreshPins();
+      break;
+    }
+    case "sim": {
+      const r = Engine.simulate(t.dataset.s);
+      if (r && r.action === "log") { /* onDetect fired the cancel overlay */ }
+      break;
+    }
+    case "sim-prox": {
+      const h = allHazards().find(x => x.status === "verified");
+      if (h) {
+        Track._alerted.delete(h.id);
+        checkProximity({ lat: h.lat + 0.0004, lng: h.lng });
+      }
+      break;
+    }
+    case "reset":
+      if (confirm("Reset motio? Local reports, points and settings will be wiped.")) {
+        localStorage.removeItem(STORE_KEY);
+        localStorage.removeItem("motio.vault.jwk");
+        indexedDB.deleteDatabase("motio-vault");
+        indexedDB.deleteDatabase("motio-tiles");
+        location.reload();
+      }
+      break;
+
+    case "onb-age": state.ageConfirmed = true; save(); renderOnb(); break;
+    case "onb-waiver": state.waiverAccepted = true; save(); renderOnb(); break;
+    case "age-confirm": {
+      state.ageConfirmed = true; save(); closeSheet();
+      const cb = window._afterAge; window._afterAge = null;
+      if (cb) setTimeout(cb, 240);
+      break;
+    }
+    case "waiver-accept": {
+      state.waiverAccepted = true; save(); closeSheet();
+      const cb = window._afterWaiver; window._afterWaiver = null;
+      if (cb) setTimeout(cb, 240);
+      break;
+    }
+  }
+});
+
+/* Non-delegated singletons */
+$("#fab").addEventListener("click", () => {
+  if (Track.active) { toast("⛔ End tracking first", "warn"); return; }
+  openCapture();
+});
+$("#darkBtn").addEventListener("click", () => {
+  state.settings.dark = !state.settings.dark;
+  save(); applyTheme();
+  if (currentScreen === "settings") renderSettings();
+});
+$("#scrim").addEventListener("click", closeSheet);
+$("#cancelBtn").addEventListener("click", () => {
+  hideCancelOverlay(true);
+  toast("✖ Detection cancelled — nothing was saved");
+});
+$("#beaconDismiss").addEventListener("click", hideBeacon);
+$("#onbSkip").addEventListener("click", finishOnboarding);
+$("#onbNext").addEventListener("click", onbNext);
+
+/* ================= Boot ================= */
 function boot() {
   applyTheme();
-  refreshModePill();
+  $("#modeChip").textContent = state.settings.mode;
+  wireEngine();
+  Sync.init();
+  Sync.onChange = () => { updateInboxBadge(); if (currentScreen === "inbox") renderInbox(); };
+  Sync.startLoop();          // the 10-minute auto-upload loop
   updateInboxBadge();
-  state._medalCount = unlockedMedals().length;
-
-  // Build onboarding slides
-  $("#onbSlides").innerHTML = SLIDES.map(s => `
-    <div class="slide"><div class="big">${s.big}</div><h2>${s.h}</h2><p>${s.p}</p></div>`).join("");
-  $("#onbNext").addEventListener("click", onbNext);
-  $("#onbSkip").addEventListener("click", () => { $("#onb").classList.add("hide"); state.onboarded = true; save(); });
-
-  $("#scrim").addEventListener("click", closeSheet);
-  $("#darkBtn").addEventListener("click", () => { state.settings.dark = !state.settings.dark; save(); applyTheme(); if (currentScreen === "settings") renderSettings(); });
-  $("#voiceBtn").addEventListener("click", toggleVoice);
-  $("#backBtn").addEventListener("click", () => showScreen("home"));
-  $("#fab").addEventListener("click", () => openCapture());
-
-  // Search on Enter within the map search field
-  document.addEventListener("keydown", (ev) => {
-    if (ev.target && ev.target.id === "mapSearch" && ev.key === "Enter") { ev.preventDefault(); doMapSearch(); }
-  });
-  // React to real connectivity changes
-  window.addEventListener("online", () => { if (currentScreen === "map") { renderMapOverlay(); } });
-  window.addEventListener("offline", () => { if (currentScreen === "map") { renderMapOverlay(); } });
-
-  showScreen("home");
-
+  renderHome();
   if (!state.onboarded) startOnboarding();
-  else $("#onb").classList.add("hide");
+  // Background community pull (non-blocking; fails silently offline).
+  Sync.fetchCommunity().then(remote => {
+    if (remote.length) { window._remoteHazards = remote; MapCtl.refreshPins(); }
+  });
 }
-document.addEventListener("DOMContentLoaded", boot);
+boot();

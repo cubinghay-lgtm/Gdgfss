@@ -3,26 +3,24 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <meta name="theme-color" content="#1f9d8f">
-  <title>PulsePath — Map the bumps. Mind the trail.</title>
+  <meta name="theme-color" content="#4f7166">
+  <title>motio — Novato road &amp; trail hazard mapping</title>
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="css/styles.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦦</text></svg>">
+  <!-- favicon: the copper dot from the motio wordmark on warm paper -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23f2efe7'/><circle cx='50' cy='50' r='26' fill='%23c07a4f'/></svg>">
 </head>
 <body>
-  <div class="device">
+  <div class="device" id="device">
 
-    <!-- Top bar -->
+    <!-- Top bar: back · wordmark · mode · 911 (persistent) · theme -->
     <header class="topbar">
       <button class="icon-btn" id="backBtn" style="display:none">←</button>
-      <div class="logo">🦦</div>
-      <div class="title">
-        <b>PulsePath</b>
-        <span id="modePill" class="mode-pill" style="padding:0;background:none">Bike Mode</span>
-      </div>
+      <div class="wordmark">mot<span class="wm-i">ı<span class="wm-dot"></span></span>o</div>
+      <span class="mode-chip" id="modeChip">bike</span>
       <span class="spacer"></span>
-      <button class="icon-btn" id="voiceBtn" title="Hands-free 'Log Danger'">🎙️</button>
-      <button class="icon-btn" id="darkBtn" title="Dark mode"><span id="darkIcon">☀️</span></button>
+      <a class="sos" href="tel:911" title="Life-threatening emergency? Call 911">911</a>
+      <button class="icon-btn" id="darkBtn" title="Toggle dark mode"><span id="darkIcon">☀️</span></button>
     </header>
 
     <!-- Toasts -->
@@ -30,20 +28,12 @@
 
     <!-- Screens -->
     <main class="screens">
-      <section id="screen-home"    class="screen active"></section>
-      <section id="screen-map"     class="screen"></section>
-      <section id="screen-track"   class="screen"></section>
-      <section id="screen-inbox"   class="screen"></section>
-      <section id="screen-profile" class="screen"></section>
+      <section id="screen-home"     class="screen active"></section>
+      <section id="screen-map"      class="screen no-pad"></section>
+      <section id="screen-track"    class="screen no-pad"></section>
+      <section id="screen-inbox"    class="screen"></section>
       <section id="screen-settings" class="screen"></section>
     </main>
-
-    <!-- Mascot pop -->
-    <div class="mascot" id="mascot">
-      <div class="o">🦦</div>
-      <b>Nice work!</b>
-      <span>+1 contribution</span>
-    </div>
 
     <!-- Bottom nav -->
     <nav class="tabbar">
@@ -52,30 +42,53 @@
       <button class="fab" id="fab" title="Quick capture">＋</button>
       <button class="tab" data-act="tab" data-tab="inbox" style="position:relative">
         <span class="ic">📥</span>Review
-        <span id="inboxBadge" style="position:absolute;top:-2px;right:18px;min-width:18px;height:18px;border-radius:9px;background:#e4572e;color:#fff;font-size:10px;display:grid;place-items:center;padding:0 4px">0</span>
+        <span id="inboxBadge" class="badge" style="display:none">0</span>
       </button>
-      <button class="tab" data-act="tab" data-tab="profile"><span class="ic">👤</span>You</button>
+      <button class="tab" data-act="tab" data-tab="settings"><span class="ic">⚙️</span>Settings</button>
     </nav>
 
     <!-- Sheet + scrim -->
     <div class="scrim" id="scrim"></div>
     <div class="sheet" id="sheet"></div>
 
-    <!-- Onboarding -->
+    <!-- 10-second Cancel-Log buffer (auto-detections) -->
+    <div class="cancel-overlay" id="cancelOverlay">
+      <div class="what" id="cancelWhat">Pothole detected</div>
+      <div class="count" id="cancelCount">10</div>
+      <button class="cancel-btn" id="cancelBtn">CANCEL LOG</button>
+      <div class="keep">Do nothing and it saves to your encrypted inbox.</div>
+    </div>
+
+    <!-- Safety Beacon: severe impact / fall -->
+    <div class="beacon" id="beacon">
+      <h2>⚠ SAFETY BEACON</h2>
+      <p>A severe impact was detected. If you are able, dismiss this alert. High-visibility flash and tone are active to help others locate you.</p>
+      <a class="call" href="tel:911">📞 CALL 911</a>
+      <button class="dismiss" id="beaconDismiss">I'm OK — dismiss</button>
+    </div>
+
+    <!-- Onboarding: welcome → how it works → age gate → safety waiver -->
     <div class="onb" id="onb">
       <div class="slides" id="onbSlides"></div>
       <div class="foot">
         <button class="btn ghost sm" id="onbSkip">Skip</button>
-        <div class="dots" id="onbDots" style="justify-content:center;align-items:center"></div>
-        <button class="btn sm" id="onbNext" style="min-width:120px">Next</button>
+        <div class="dots" id="onbDots"></div>
+        <button class="btn sm" id="onbNext" style="min-width:110px">Next</button>
       </div>
     </div>
 
   </div>
 
+  <!-- Vendored libraries: no CDN at runtime -->
   <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/supabase/supabase.min.js"></script>
+  <!-- motio modules (plain globals, strict load order) -->
+  <script src="js/civic.js"></script>
+  <script src="js/crypto.js"></script>
   <script src="js/data.js"></script>
   <script src="js/sensors.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/sync.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
