@@ -150,33 +150,47 @@ function zoneSensorFactor(zone) {
 }
 
 /* ---------------- Category -> municipal route ----------------
-   motio's six capture categories map onto Novato's four routes.
-   pothole & manhole defects go through the city service-request
-   process (Public Works); trail hazards to Parks/Open Space;
-   oil/waterway to MCSTOPPP; dumping to FixItMarin (form only). */
+   The four primary categories map onto Novato's official routes.
+   A few subtypes override to a more specific department (e.g. an
+   oil sheen goes to stormwater, not Public Works). */
 
 const CATEGORY_ROUTING = {
-  pothole: "pothole",
-  manhole: "pothole",
-  rut:     "trail_or_open_space_hazard",
-  branch:  "trail_or_open_space_hazard",
-  oil:     "oil_leak_or_waterway_pollution",
-  dumping: "illegal_dumping",
+  pothole: "pothole",                    // Public Works service request
+  branch:  "trail_or_open_space_hazard", // Parks / Open Space
+  trash:   "illegal_dumping",            // FixItMarin
+  other:   "pothole",                    // default to Public Works
+};
+const SUBTYPE_ROUTING = {
+  chipseal_oil:   "oil_leak_or_waterway_pollution",
+  standing_water: "oil_leak_or_waterway_pollution",
+  mud_wash:       "trail_or_open_space_hazard",
+  washout_gully:  "trail_or_open_space_hazard",
 };
 
+/* Title-Case department names for the Report Directory (spec). */
+const DEPARTMENT_NAMES = {
+  pothole:                        "Novato Public Works",
+  trail_or_open_space_hazard:     "Novato Parks & Open Space",
+  oil_leak_or_waterway_pollution: "Marin County Stormwater (MCSTOPPP)",
+  illegal_dumping:                "FixItMarin",
+};
+
+function routeForHazard(hazard) {
+  return SUBTYPE_ROUTING[hazard.subtype] || CATEGORY_ROUTING[hazard.cat] || "pothole";
+}
+
 /* ---------------- Civic email drafter ----------------
-   Returns a mailto-ready structured draft for a hazard:
-   { routeKey, to, subject, body, formUrl, mailto|null }.
-   `mailto` is null when the route has no target email
-   (illegal dumping -> form-only via FixItMarin). */
-function buildCivicEmail(hazard, categoryLabel, reporterName) {
-  const routeKey = CATEGORY_ROUTING[hazard.cat] || "pothole";
+   Returns { routeKey, department, to, subject, body, formUrl, mailto|null }.
+   The reporter's name + report timestamp are included ONLY when the
+   profile is Public (spec); a Private reporter stays anonymous. */
+function buildCivicEmail(hazard, categoryLabel, opts) {
+  opts = opts || {};
+  const routeKey = routeForHazard(hazard);
   const route = NOVATO_MUNICIPAL_DIRECTORY.routing[routeKey];
   const zone = zoneForPoint(hazard.lat, hazard.lng);
   const coords = `${hazard.lat.toFixed(5)}, ${hazard.lng.toFixed(5)}`;
   const locText = zone ? `${coords} (${zone.title})` : `${coords} — Novato, CA`;
 
-  // Fill the bracketed placeholders in the official subject template.
   const subject = route.subjectTemplate
     .replace("[Issue Type]", categoryLabel)
     .replace("[Fallen Tree / Trail Erosion / Blockage]", categoryLabel)
@@ -187,29 +201,36 @@ function buildCivicEmail(hazard, categoryLabel, reporterName) {
     .replace("[Exact Location / Nearest Drain or Waterway]", coords)
     .replace("[Exact Location / Nearest Cross Streets]", coords);
 
-  const when = new Date(hazard.createdAt || Date.now()).toLocaleString("en-US");
+  const lines = [
+    `  • Type: ${categoryLabel}`,
+    `  • Severity: ${hazard.sev}/5`,
+    `  • Location: ${locText}`,
+    `  • Map: https://www.openstreetmap.org/?mlat=${hazard.lat}&mlon=${hazard.lng}#map=18/${hazard.lat}/${hazard.lng}`,
+    `  • Notes: ${hazard.note || "(none)"}`,
+  ];
+  // Public reporters attach identity + timestamp; private reporters do not.
+  if (opts.isPublic) {
+    lines.push(`  • Reported by: ${opts.reporterName || "A Novato resident"}`);
+    lines.push(`  • Reported at: ${new Date(hazard.createdAt || Date.now()).toLocaleString("en-US")}`);
+  }
+  const signoff = opts.isPublic ? (opts.reporterName || "A Novato resident") : "A Novato resident (anonymous)";
+
   const body =
 `To whom it may concern,
 
-I am reporting a non-emergency ${categoryLabel.toLowerCase()} hazard observed in Novato.
+I am reporting a non-emergency ${categoryLabel.toLowerCase()} hazard in Novato.
 
-  • Type: ${categoryLabel}
-  • Severity (reporter-rated): ${hazard.sev}/5
-  • GPS location: ${locText}
-  • Map link: https://www.openstreetmap.org/?mlat=${hazard.lat}&mlon=${hazard.lng}#map=18/${hazard.lat}/${hazard.lng}
-  • Observed: ${when}
-  • Notes: ${hazard.note || "(none)"}
-  • Photo: ${hazard.hasPhoto ? "captured by reporter, available on request" : "not captured"}
+${lines.join("\n")}
 
-This report was logged with motio, a voluntary community reporting aid.
+Reported through motio, a voluntary community safety tool.
 ${NOVATO_MUNICIPAL_DIRECTORY.disclaimer}
 
 Thank you,
-${reporterName || "A Novato community member"}`;
+${signoff}`;
 
   const mailto = route.targetEmail
     ? `mailto:${route.targetEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
     : null;
 
-  return { routeKey, to: route.targetEmail, subject, body, formUrl: route.contactFormEndpoint, mailto };
+  return { routeKey, department: DEPARTMENT_NAMES[routeKey], to: route.targetEmail, subject, body, formUrl: route.contactFormEndpoint, mailto };
 }

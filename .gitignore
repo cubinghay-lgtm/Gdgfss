@@ -1,3 +1,7 @@
 node_modules/
 scratch_*.png
 .DS_Store
+
+# local test artifacts
+motio-*.png
+.playwright-mcp/

@@ -4,90 +4,94 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#4f7166">
-  <title>motio — Novato road &amp; trail hazard mapping</title>
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="motio">
+  <title>motio — Novato road &amp; trail safety</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="vendor/leaflet/images/motio_logo1.png">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23f2efe7'/><circle cx='50' cy='47' r='23' fill='%234f7166'/><circle cx='68' cy='30' r='7' fill='%23c07a4f'/></svg>">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="css/styles.css">
-  <!-- favicon: the copper dot from the motio wordmark on warm paper -->
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23f2efe7'/><circle cx='50' cy='50' r='26' fill='%23c07a4f'/></svg>">
 </head>
 <body>
   <div class="device" id="device">
 
-    <!-- Top bar: back · wordmark · mode · 911 (persistent) · theme -->
+    <!-- Top bar: logo · mode · connectivity · 911 -->
     <header class="topbar">
-      <button class="icon-btn" id="backBtn" style="display:none">←</button>
-      <div class="wordmark">mot<span class="wm-i">ı<span class="wm-dot"></span></span>o</div>
-      <span class="mode-chip" id="modeChip">bike</span>
+      <img class="brand" src="vendor/leaflet/images/motio_logo1.png" alt="motio">
+      <span class="mode-chip" id="modeChip" data-act="cycle-mode" role="button" tabindex="0">Bike</span>
       <span class="spacer"></span>
-      <a class="sos" href="tel:911" title="Life-threatening emergency? Call 911">911</a>
-      <button class="icon-btn" id="darkBtn" title="Toggle dark mode"><span id="darkIcon">☀️</span></button>
+      <button class="cloud" id="cloudBtn" data-act="cloud-status" title="Sync status" aria-label="Sync status">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path class="cloud-body" d="M7 18h10a4 4 0 0 0 .5-7.97 6 6 0 0 0-11.66-1.2A3.5 3.5 0 0 0 6 18z"/>
+          <path class="cloud-bolt" d="M12.5 12l-2.2 3.2h1.7l-1 2.8 2.6-3.6h-1.6z"/>
+        </svg>
+      </button>
+      <a class="sos" href="tel:911" aria-label="Call 911 emergency">911</a>
     </header>
 
+    <!-- Weather safety banner (non-intrusive; hidden until data) -->
+    <div class="wx-banner" id="wxBanner" hidden>
+      <span class="wx-ic" aria-hidden="true">🌬️</span>
+      <span class="wx-text" id="wxText"></span>
+      <button class="wx-x" id="wxDismiss" aria-label="Dismiss">×</button>
+    </div>
+
     <!-- Toasts -->
-    <div class="toast-wrap" id="toasts"></div>
+    <div class="toast-wrap" id="toasts" aria-live="polite"></div>
 
     <!-- Screens -->
     <main class="screens">
       <section id="screen-home"     class="screen active"></section>
       <section id="screen-map"      class="screen no-pad"></section>
-      <section id="screen-track"    class="screen no-pad"></section>
+      <section id="screen-ride"     class="screen no-pad"></section>
       <section id="screen-inbox"    class="screen"></section>
       <section id="screen-settings" class="screen"></section>
     </main>
 
-    <!-- Bottom nav -->
-    <nav class="tabbar">
-      <button class="tab active" data-act="tab" data-tab="home"><span class="ic">🏠</span>Home</button>
-      <button class="tab" data-act="tab" data-tab="map"><span class="ic">🗺️</span>Map</button>
-      <button class="fab" id="fab" title="Quick capture">＋</button>
-      <button class="tab" data-act="tab" data-tab="inbox" style="position:relative">
-        <span class="ic">📥</span>Review
-        <span id="inboxBadge" class="badge" style="display:none">0</span>
-      </button>
-      <button class="tab" data-act="tab" data-tab="settings"><span class="ic">⚙️</span>Settings</button>
+    <!-- Bottom nav: 5 true-centered slots, raised report button -->
+    <nav class="tabbar" role="tablist">
+      <button class="tab active" data-act="tab" data-tab="home" role="tab"><span class="ic">🏠</span><span class="tl">Home</span></button>
+      <button class="tab" data-act="tab" data-tab="map" role="tab"><span class="ic">🗺️</span><span class="tl">Map</span></button>
+      <button class="fab" id="fab" data-act="capture" aria-label="Add a report">＋</button>
+      <button class="tab" data-act="tab" data-tab="inbox" role="tab"><span class="ic">📋</span><span class="tl">Reports</span><span class="badge" id="inboxBadge" hidden>0</span></button>
+      <button class="tab" data-act="tab" data-tab="settings" role="tab"><span class="ic">⚙️</span><span class="tl">Settings</span></button>
     </nav>
 
-    <!-- Sheet + scrim -->
+    <!-- Scrim + bottom sheet -->
     <div class="scrim" id="scrim"></div>
-    <div class="sheet" id="sheet"></div>
+    <div class="sheet" id="sheet" role="dialog" aria-modal="true"></div>
 
-    <!-- 10-second Cancel-Log buffer (auto-detections) -->
-    <div class="cancel-overlay" id="cancelOverlay">
-      <div class="what" id="cancelWhat">Pothole detected</div>
+    <!-- 10-second review buffer for automatic detections -->
+    <div class="cancel-overlay" id="cancelOverlay" aria-live="assertive">
+      <div class="what" id="cancelWhat">Bump detected</div>
       <div class="count" id="cancelCount">10</div>
-      <button class="cancel-btn" id="cancelBtn">CANCEL LOG</button>
-      <div class="keep">Do nothing and it saves to your encrypted inbox.</div>
+      <button class="cancel-btn" id="cancelBtn">Not a hazard — cancel</button>
+      <div class="keep">Do nothing and it's saved to your reports.</div>
     </div>
 
-    <!-- Safety Beacon: severe impact / fall -->
-    <div class="beacon" id="beacon">
-      <h2>⚠ SAFETY BEACON</h2>
-      <p>A severe impact was detected. If you are able, dismiss this alert. High-visibility flash and tone are active to help others locate you.</p>
-      <a class="call" href="tel:911">📞 CALL 911</a>
-      <button class="dismiss" id="beaconDismiss">I'm OK — dismiss</button>
-    </div>
-
-    <!-- Onboarding: welcome → how it works → age gate → safety waiver -->
-    <div class="onb" id="onb">
+    <!-- Onboarding (hard gate: Confirm, not Next) -->
+    <div class="onb" id="onb" role="dialog" aria-modal="true">
       <div class="slides" id="onbSlides"></div>
       <div class="foot">
-        <button class="btn ghost sm" id="onbSkip">Skip</button>
         <div class="dots" id="onbDots"></div>
-        <button class="btn sm" id="onbNext" style="min-width:110px">Next</button>
+        <button class="btn" id="onbAction" style="min-width:150px">Continue</button>
       </div>
     </div>
 
   </div>
 
-  <!-- Vendored libraries: no CDN at runtime -->
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/supabase/supabase.min.js"></script>
-  <!-- motio modules (plain globals, strict load order) -->
   <script src="js/civic.js"></script>
   <script src="js/crypto.js"></script>
   <script src="js/data.js"></script>
-  <script src="js/sensors.js"></script>
+  <script src="js/platform.js"></script>
+  <script src="js/learn.js"></script>
   <script src="js/engine.js"></script>
+  <script src="js/weather.js"></script>
   <script src="js/sync.js"></script>
   <script src="js/app.js"></script>
 </body>

@@ -1,0 +1,15 @@
+{
+  "name": "motio — Novato road & trail safety",
+  "short_name": "motio",
+  "description": "Community-driven road and trail hazard mapping for Novato cyclists and commuters.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f2efe7",
+  "theme_color": "#4f7166",
+  "icons": [
+    { "src": "vendor/leaflet/images/motio_logo1.png", "sizes": "1615x640", "type": "image/png", "purpose": "any" },
+    { "src": "vendor/leaflet/images/motio_logo1.png", "sizes": "1615x640", "type": "image/png", "purpose": "maskable" }
+  ]
+}
