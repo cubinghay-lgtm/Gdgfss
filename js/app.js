@@ -262,7 +262,7 @@ async function startTracking() {
   MapCtl.destroy();
   Track.startWake();
   Track.active = true; Track.startedAt = Date.now(); Track.distanceM = 0; Track.detections = 0;
-  Track.lastPos = null; Track._alerted = new Set(); Track._zoneId = null; Track._elev = null;
+  Track.lastPos = null; Track._alerted = new Set(); Track._zoneId = null; Track._elev = null; Track._elevDistAt = 0;
 
   const started = bike ? Engine.start() : { motion: false };
   Platform.startWatch(onTrackPosition);
@@ -327,7 +327,18 @@ function onTrackPosition(pos) {
   if (pos.acc == null || pos.acc < 60) { if (Track.lastPos) { const d = haversineM(Track.lastPos, pos); if (d > 1 && d < 200) Track.distanceM += d; } Track.lastPos = { lat: pos.lat, lng: pos.lng }; }
 
   // Elevation fusion -> slope (throttled; backend proxy, keyless USGS fallback).
-  if (Date.now() - Track._elevAt > 15000) { Track._elevAt = Date.now(); fetchElevation(pos.lat, pos.lng).then(ev => { if (ev != null && Track._elev != null && Track.lastPos) { const dz = ev - Track._elev; const slope = 100 * dz / Math.max(20, Track.distanceM % 200 || 30); Engine.setSlope(Math.max(-25, Math.min(25, slope))); } Track._elev = ev; }); }
+  // Slope = rise / run over the real distance ridden since the last sample.
+  if (Date.now() - Track._elevAt > 15000) {
+    Track._elevAt = Date.now();
+    fetchElevation(pos.lat, pos.lng).then(ev => {
+      const run = Track.distanceM - (Track._elevDistAt || 0);
+      if (ev != null && Track._elev != null && run > 10) {
+        const slope = 100 * (ev - Track._elev) / run;
+        Engine.setSlope(Math.max(-25, Math.min(25, slope)));
+      }
+      if (ev != null) { Track._elev = ev; Track._elevDistAt = Track.distanceM; }
+    });
+  }
 
   // Zone entry announcement.
   const z = zoneForPoint(pos.lat, pos.lng); const zid = z ? z.id : null;
@@ -340,7 +351,7 @@ function checkProximity(pos) {
   for (const h of allHazards()) {
     if (h.status !== "verified" || Track._alerted.has(h.id)) continue;
     if (haversineM(pos, h) <= radius) {
-      Track._alerted.add(h.id); Track.detections = Math.max(Track.detections, 0);
+      Track._alerted.add(h.id);
       const c = CATEGORIES[h.cat];
       const sent = state.settings.notifications && Platform.notify("Hazard ahead", `${c.label} about ${Math.round(haversineM(pos, h) * 3.281)} ft ahead`);
       if (state.settings.tts) Platform.speak(`Heads up. ${c.label} ahead.`);
@@ -746,7 +757,6 @@ function openPinEdit(id) {
 }
 
 /* Singletons */
-$("#fab") && null;
 $("#scrim").addEventListener("click", closeSheet);
 $("#cancelBtn").addEventListener("click", () => { hideCancel(true); toast("Cancelled — nothing saved"); });
 $("#wxDismiss").addEventListener("click", () => { window._wxDismissed = true; $("#wxBanner").hidden = true; });
