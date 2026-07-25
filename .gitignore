@@ -5,3 +5,8 @@ scratch_*.png
 # local test artifacts
 motio-*.png
 .playwright-mcp/
+
+# secrets — never commit real tokens
+.env
+.env.local
+*.key
